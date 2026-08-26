@@ -2,6 +2,10 @@
 # Local test artifacts, secrets (.env), and tooling stay out without a rule
 # for each one. Tracked files are unaffected.
 /*
+!/.claude-plugin/
+!/.claude-plugin/**
+!/hooks/
+!/hooks/**
 !/.github/
 !/.github/**
 !/benchmarks/
@@ -16,6 +20,7 @@
 !/gui/**
 !/tests/
 !/tests/**
+!/.coderabbit.yaml
 !/.dockerignore
 !/.env.example
 !/.gitignore
