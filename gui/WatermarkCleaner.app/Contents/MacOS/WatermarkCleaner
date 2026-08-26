@@ -1,50 +1,65 @@
 #!/bin/bash
-# AI 水印清理工具 —— .app 包装内的启动脚本
-# 逻辑同 gui/launch.command，只是用相对自身的路径回到仓库里的 gui 目录。
-# 路径关系：gui/WatermarkCleaner.app/Contents/MacOS/WatermarkCleaner → 上溯三层即 gui/
+# AI 水印清理工具 —— 自我管理启动器
+# 两种模式：
+#   开发模式：App 还在仓库 gui/ 目录里 → 直接用仓库代码（相对路径上溯三层）。
+#   独立模式：App 被拷到 /Applications 等任意位置 → 自动从 GitHub 下载/更新代码
+#             到 ~/Library/Application Support/AI水印清理工具/，无需本地保留仓库。
 
-SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
-GUI_DIR="$(cd "$SELF_DIR/../../.." && pwd)"
-APP_PY="$GUI_DIR/app.py"
+REPO="zdrjson/watermarks-remover"
+BASE="$HOME/Library/Application Support/AI水印清理工具"
 
 alert() {
     /usr/bin/osascript -e "display alert \"AI 水印清理工具\" message \"$1\" as critical buttons {\"知道了\"} default button 1" >/dev/null 2>&1
 }
 
-if [ ! -f "$APP_PY" ]; then
-    alert "找不到程序文件 app.py。请把 WatermarkCleaner.app 留在仓库的 gui 文件夹里，不要单独拷走。"
-    exit 1
+# 让 curl 跟随系统代理（Clash 等只设系统代理时，Finder 启动的进程默认没有代理环境变量）
+SYSPROXY=$(/usr/sbin/scutil --proxy 2>/dev/null | /usr/bin/awk '
+    /HTTPSEnable/  {e=$3} /HTTPSProxy/ {h=$3} /HTTPSPort/ {p=$3}
+    END {if (e==1 && h!="" && p!="") print h":"p}')
+if [ -n "$SYSPROXY" ]; then
+    export https_proxy="http://$SYSPROXY" http_proxy="http://$SYSPROXY"
 fi
 
-CANDIDATES=(
-    "/opt/homebrew/bin/python3"
-    "/usr/local/bin/python3"
-    "/usr/bin/python3"
-)
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+DEV_GUI="$(cd "$SELF_DIR/../../.." 2>/dev/null && pwd)"
 
-PATH_PY="$(command -v python3 2>/dev/null)"
-if [ -n "$PATH_PY" ]; then
-    CANDIDATES+=("$PATH_PY")
+if [ -f "$DEV_GUI/app.py" ] && [ -f "$DEV_GUI/core.py" ]; then
+    GUI_DIR="$DEV_GUI"                      # 开发模式
+else
+    # 独立模式：查远端最新提交，有更新就重新下载（原子替换），离线则用已缓存的版本
+    mkdir -p "$BASE"
+    CUR="$BASE/current"
+    REMOTE_SHA=$(/usr/bin/curl -fsSL -m 8 "https://api.github.com/repos/$REPO/commits/main" 2>/dev/null \
+        | /usr/bin/grep -m1 '"sha"' | /usr/bin/cut -d'"' -f4)
+    LOCAL_SHA=$(cat "$BASE/sha" 2>/dev/null)
+    if [ -n "$REMOTE_SHA" ] && { [ ! -f "$CUR/gui/app.py" ] || [ "$REMOTE_SHA" != "$LOCAL_SHA" ]; }; then
+        TMP="$BASE/download.$$"
+        mkdir -p "$TMP"
+        if /usr/bin/curl -fsSL -m 180 "https://github.com/$REPO/archive/$REMOTE_SHA.tar.gz" \
+            | /usr/bin/tar -xz -C "$TMP" --strip-components 1 2>/dev/null; then
+            rm -rf "$CUR" && mv "$TMP" "$CUR" && echo "$REMOTE_SHA" > "$BASE/sha"
+        else
+            rm -rf "$TMP"
+        fi
+    fi
+    if [ ! -f "$CUR/gui/app.py" ]; then
+        alert "首次使用需要联网从 GitHub 下载程序（github.com/$REPO），刚才没有下载成功。请确认网络（或代理）可以访问 GitHub 后重试。"
+        exit 1
+    fi
+    GUI_DIR="$CUR/gui"
 fi
 
+# 找一个带 tkinter 的 python3
 PY=""
-for candidate in "${CANDIDATES[@]}"; do
-    if [ -x "$candidate" ] && "$candidate" -c "import tkinter" >/dev/null 2>&1; then
-        PY="$candidate"
-        break
+for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3 "$(command -v python3 2>/dev/null)"; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ] && "$candidate" -c "import tkinter" >/dev/null 2>&1; then
+        PY="$candidate"; break
     fi
 done
-
 if [ -z "$PY" ]; then
-    alert "这台电脑上的 Python 缺少图形界面组件（tkinter），程序无法启动。
-
-请打开「终端」执行下面这行命令后重试：
-
-brew install python-tk
-
-如果还没装 Homebrew，请先访问 brew.sh 按说明安装。"
+    alert "这台电脑上的 Python 缺少图形界面组件（tkinter）。请打开「终端」执行：brew install python-tk 后重试。"
     exit 1
 fi
 
 cd "$GUI_DIR" || exit 1
-exec "$PY" "$APP_PY"
+exec "$PY" "$GUI_DIR/app.py"

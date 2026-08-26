@@ -10,6 +10,8 @@
 2. 点「＋ 添加文件」或「＋ 添加文件夹」→ 自动检测
 3. 点「一键清理」→ 干净副本另存为「原文件名_已清理」，**不改动原文件**
 
+**独立安装**：把 `WatermarkCleaner.app` 拷到「应用程序」后即可删除本仓库——App 脱离仓库运行时会自动从 GitHub 下载最新代码到 `~/Library/Application Support/AI水印清理工具/`，每次启动检查更新，离线时用已缓存的版本（仅首次启动需要联网）。
+
 支持 md／txt／html／svg／png／jpg／webp／pdf／docx／pptx／epub／mp4／mp3 等 20 余种格式。
 
 ## 依赖
