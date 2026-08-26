@@ -12,6 +12,8 @@
 !/service/**
 !/skills/remove-ai-marks/
 !/skills/remove-ai-marks/**
+!/gui/
+!/gui/**
 !/tests/
 !/tests/**
 !/.dockerignore
