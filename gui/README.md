@@ -12,6 +12,8 @@
 
 **独立安装**：把 `WatermarkCleaner.app` 拷到「应用程序」后即可删除本仓库——App 脱离仓库运行时会自动从 GitHub 下载最新代码到 `~/Library/Application Support/AI水印清理工具/`，每次启动检查更新，离线时用已缓存的版本（仅首次启动需要联网）。
 
+这份现成的 App 是 bash 壳，实际用 Homebrew 的 Python 起 Tk，因此菜单栏应用名会显示成「Python」。想让菜单栏显示应用名而非 Python，可运行 `bash gui/build-app.sh` 构建原生版：它把 `gui/native/stub.c` 编译成自带 bundle 的启动存根（需要 clang 与 `brew install python@3.14 python-tk`），直接安装到「/Applications/AI 水印清理工具.app」，自动更新逻辑与 bash 版一致。
+
 支持 md／txt／html／svg／png／jpg／webp／pdf／docx／pptx／epub／mp4／mp3 等 20 余种格式。
 
 ## 依赖

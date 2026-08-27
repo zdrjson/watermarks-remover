@@ -3,6 +3,9 @@
 # 依次探测几个常见的 python3，挑第一个自带 tkinter 的来跑 app.py。
 # 一个都没有时弹中文提示，绝不闪退。
 
+# Finder 双击启动的进程只有系统默认 PATH，Homebrew 装的 qpdf／exiftool 一律找不到。
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 GUI_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_PY="$GUI_DIR/app.py"
 

@@ -5,6 +5,9 @@
 #   独立模式：App 被拷到 /Applications 等任意位置 → 自动从 GitHub 下载/更新代码
 #             到 ~/Library/Application Support/AI水印清理工具/，无需本地保留仓库。
 
+# Finder 双击启动的进程只有系统默认 PATH，Homebrew 装的 qpdf／exiftool 一律找不到。
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 REPO="zdrjson/watermarks-remover"
 BASE="$HOME/Library/Application Support/AI水印清理工具"
 

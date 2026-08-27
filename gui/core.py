@@ -40,6 +40,13 @@ CLEANED_SUFFIX = "_已清理"
 SCAN_TIMEOUT = 180
 CLEAN_TIMEOUT = 900
 
+#: Homebrew 等常见的第三方命令目录。
+#:
+#: Finder 双击启动时进程只继承系统默认 PATH（``/usr/bin:/bin:/usr/sbin:/sbin``），
+#: 装在 Homebrew 里的 ``qpdf``／``exiftool`` 一律找不到——界面会误报「未安装」，
+#: 上游脚本也会静默降级成浅层清理。这里显式补上这些目录。
+EXTRA_TOOL_DIRS: tuple[str, ...] = ("/opt/homebrew/bin", "/usr/local/bin")
+
 
 # ---------------------------------------------------------------------------
 # 数据结构
@@ -84,14 +91,52 @@ LABEL_DOCPROPS = "文档属性"
 
 
 # ---------------------------------------------------------------------------
+# PATH 增广（内部实现细节，公开契约不变）
+# ---------------------------------------------------------------------------
+
+
+def _augmented_path(base: str | None = None) -> str:
+    """把 ``EXTRA_TOOL_DIRS`` 前置到 PATH，去重后返回。"""
+    current = os.environ.get("PATH", "") if base is None else base
+    parts: list[str] = []
+    for item in (*EXTRA_TOOL_DIRS, *current.split(os.pathsep)):
+        if item and item not in parts:
+            parts.append(item)
+    return os.pathsep.join(parts)
+
+
+def _augmented_env() -> dict[str, str]:
+    """给子进程用的环境：PATH 前置 Homebrew 目录，输出强制 UTF-8。
+
+    上游 ``clean_file.py`` 内部同样靠 PATH 找 ``qpdf``／``exiftool``，
+    不补 PATH 的话 PDF 与残余元数据清理会静默降级。
+    """
+    env = dict(os.environ)
+    env["PATH"] = _augmented_path(env.get("PATH", ""))
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
+def _which(tool: str) -> str | None:
+    """先按 PATH 找，再显式翻 ``EXTRA_TOOL_DIRS``；都没有返回 None。"""
+    found = shutil.which(tool)
+    if found:
+        return found
+    for directory in EXTRA_TOOL_DIRS:
+        candidate = Path(directory) / tool
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # 子进程调用
 # ---------------------------------------------------------------------------
 
 
 def _run(cmd: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
     """跑一个子进程，永远以 UTF-8 文本模式拿回 stdout/stderr。"""
-    env = dict(os.environ)
-    env["PYTHONIOENCODING"] = "utf-8"
+    env = _augmented_env()
     return subprocess.run(  # noqa: S603 - 命令由本模块拼装，不含用户输入的可执行文件
         cmd,
         capture_output=True,
@@ -278,11 +323,15 @@ def default_output_path(path: str | Path, out_dir: str | Path | None = None) -> 
 
 
 def tool_hints() -> list[str]:
-    """检查外部依赖，缺什么就给一条中文提示；都齐全返回空列表。"""
+    """检查外部依赖，缺什么就给一条中文提示；都齐全返回空列表。
+
+    除 PATH 外还显式探测 ``EXTRA_TOOL_DIRS``——Finder 双击启动的进程
+    PATH 里没有 Homebrew 目录，只查 PATH 会把装好的工具误报成「未安装」。
+    """
     hints: list[str] = []
-    if shutil.which("qpdf") is None:
+    if _which("qpdf") is None:
         hints.append("未安装 qpdf，PDF 只能做浅层清理。终端执行：brew install qpdf")
-    if shutil.which("exiftool") is None:
+    if _which("exiftool") is None:
         hints.append(
             "未安装 exiftool，图片与音视频的元数据可能清不干净。终端执行：brew install exiftool"
         )
