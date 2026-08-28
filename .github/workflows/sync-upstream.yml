@@ -1,12 +1,11 @@
 name: Sync upstream
 
 # 定时同步上游 guillaumemeyer/watermarks-remover 的变动到本 fork。
-# 用 GitHub 官方 merge-upstream 接口（等同网页上的 Sync fork 按钮）：
-# 合并发生在 GitHub 服务端，不经过 git push，因此不受
-# 「GITHUB_TOKEN 不得推送 workflow 文件改动」的平台限制
-# （2026-08-27 那次失败的根因——上游改了自家 release-images.yml，push 被拒）。
-# 若某天服务端接口也拒绝，任务会响亮地失败，届时改用带 workflow 权限的 PAT。
-# 冲突（HTTP 409）时任务失败并自动开 issue 提醒手动处理。
+# 平台硬限制（实测两次验证）：Actions 内置令牌既不能 push workflow 文件改动，
+# 也不能通过 merge-upstream 服务端接口带入 workflow 文件改动。
+# 因此策略为：git 合并上游全部内容，但 .github/workflows/ 一律保持本 fork
+# 版本不动（上游 CI 对 fork 本无用处，其余代码照常同步）。
+# 其他文件的合并冲突：任务失败并自动开 issue 提醒手动处理。
 
 on:
   schedule:
@@ -21,23 +20,45 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Sync fork via merge-upstream API
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream/main (workflows excluded)
         id: merge
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          set +e
-          RESP=$(gh api -X POST "repos/${{ github.repository }}/merge-upstream" -f branch=main 2>&1)
-          CODE=$?
-          echo "$RESP"
-          if [ "$CODE" -eq 0 ]; then
-            echo "同步完成，方式：$(echo "$RESP" | jq -r '.merge_type // "unknown"')"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/guillaumemeyer/watermarks-remover.git
+          git fetch upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "已是最新，无需同步。"
             exit 0
           fi
-          if echo "$RESP" | grep -q "HTTP 409"; then
-            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          set +e
+          git merge --no-commit --no-ff upstream/main
+          MERGE_RC=$?
+          set -e
+          if [ $MERGE_RC -ne 0 ]; then
+            # workflow 目录内的冲突一律取本 fork 版本；其余冲突走人工
+            git checkout --ours -- .github/workflows 2>/dev/null || true
+            git add -A -- .github/workflows 2>/dev/null || true
+            if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+              echo "conflict=true" >> "$GITHUB_OUTPUT"
+              git merge --abort || true
+              exit 1
+            fi
           fi
-          exit 1
+          # 无论上游怎么改 workflow，都还原成本 fork 的版本（改动的还原、新增的剔除）
+          git restore --source=HEAD --staged --worktree -- .github/workflows 2>/dev/null || true
+          ADDED=$(git diff --cached --name-only --diff-filter=A -- .github/workflows)
+          if [ -n "$ADDED" ]; then
+            echo "$ADDED" | while read -r f; do git rm -q -f --cached -- "$f"; rm -f -- "$f"; done
+            echo "已剔除上游新增的 workflow 文件：$ADDED"
+          fi
+          git commit --no-edit
+          git push origin main
+          echo "上游有新变动，已同步（workflow 文件保持本 fork 版本）。"
 
       - name: Open issue on merge conflict
         if: failure() && steps.merge.outputs.conflict == 'true'
