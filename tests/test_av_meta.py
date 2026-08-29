@@ -15,6 +15,7 @@ from av_meta import (
     detect_av_format,
     inspect_av,
 )
+from image_meta import _contains_c2pa_prov_box
 
 # ---------------------------------------------------------------------------
 # Fixture builders
@@ -41,6 +42,8 @@ def _moov_with_udta(udta_payload: bytes) -> bytes:
 
 
 XMP_UUID_HEX = bytes.fromhex("be7acfcb97a942e89c71999491e3afac")
+# C2PA ContentProvenanceBox user type for BMFF containers (MP4/MOV/HEIF/AVIF).
+C2PA_BMFF_UUID = bytes.fromhex("d8fec3d61b0e483c92975828877ec481")
 
 
 def _mp4_with_xmp(xmp_text: bytes) -> bytes:
@@ -55,6 +58,14 @@ def _mp4_with_udta_tag(tag_text: bytes) -> bytes:
     )
     mdat = _isobmff_box(b"mdat", b"\x00" * 16)
     return _mp4(moov, mdat)
+
+
+def _mp4_with_c2pa_manifest(purpose: bytes = b"manifest", data: bytes | None = None) -> bytes:
+    if data is None:
+        data = b"c2pa" + b"\x00" * 8 + b"jumb" + b"\x00" * 4  # fake JUMBF-ish store
+    c2pa_box = _isobmff_box(b"uuid", C2PA_BMFF_UUID + purpose + b"\x00" + data)
+    mdat = _isobmff_box(b"mdat", b"\x00" * 16)
+    return _mp4(c2pa_box, mdat)
 
 
 def _riff_chunk(cid: bytes, payload: bytes) -> bytes:
@@ -479,6 +490,130 @@ def test_mp4_clean_file_is_idempotent_when_already_clean(tmp_path):
     result = clean_av(src, dest, strip_all_metadata=True)
     assert result["still_has_ai_metadata"] is False
     assert result["still_has_c2pa"] is False
+
+
+def test_mp4_c2pa_manifest_uuid_detected_and_stripped(tmp_path):
+    data = _mp4_with_c2pa_manifest()
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(data)
+
+    report = inspect_av(src)
+    assert report.format == "mp4"
+    assert report.has_c2pa is True
+    assert report.has_ai_metadata is True
+    assert any("content-provenance" in f for f in report.findings)
+
+    dest = tmp_path / "clip.cleaned.mp4"
+    result = clean_av(src, dest, strip_all_metadata=True)
+    cleaned = dest.read_bytes()
+    assert result["still_has_c2pa"] is False
+    assert C2PA_BMFF_UUID not in cleaned
+    assert any("content-provenance" in a for a in result["actions"])
+
+
+def test_mp4_c2pa_manifest_stripped_in_keep_mode_by_user_type(tmp_path):
+    # Manifest data with NO ASCII 'c2pa'/'jumb' marker: the old substring scan
+    # would miss it in keep-mode, so this proves the C2PA user type alone now
+    # drives detection and removal.
+    data = _mp4_with_c2pa_manifest(data=bytes(range(1, 64)))
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(data)
+
+    report = inspect_av(src)
+    assert report.has_c2pa is True
+
+    dest = tmp_path / "clip.cleaned.mp4"
+    result = clean_av(src, dest, strip_all_metadata=False)
+    assert result["still_has_c2pa"] is False
+    assert C2PA_BMFF_UUID not in dest.read_bytes()
+    assert any("content-provenance" in a for a in result["actions"])
+
+
+def test_mp4_c2pa_manifest_preserves_mdat_offset(tmp_path):
+    data = _mp4_with_c2pa_manifest()
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(data)
+    dest = tmp_path / "clip.cleaned.mp4"
+
+    clean_av(src, dest, strip_all_metadata=True)
+
+    cleaned = dest.read_bytes()
+    assert cleaned.index(b"mdat") == data.index(b"mdat")
+    assert C2PA_BMFF_UUID not in cleaned
+    assert b"free" in cleaned  # replaced with an equal-size free box, offsets intact
+
+
+def test_mp4_c2pa_update_manifest_appended_stripped(tmp_path):
+    # Update manifests are appended as the last box with box_purpose "update".
+    data = _mp4(
+        _isobmff_box(b"mdat", b"\x00" * 16),
+        _isobmff_box(b"uuid", C2PA_BMFF_UUID + b"update\x00" + bytes(range(1, 32))),
+    )
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(data)
+
+    report = inspect_av(src)
+    assert report.has_c2pa is True
+
+    dest = tmp_path / "clip.cleaned.mp4"
+    result = clean_av(src, dest, strip_all_metadata=False)
+    assert result["still_has_c2pa"] is False
+    assert C2PA_BMFF_UUID not in dest.read_bytes()
+
+
+def test_mp4_c2pa_merkle_aux_box_detected_by_user_type(tmp_path):
+    # A "merkle" auxiliary box holds only binary Merkle data (no ASCII marker),
+    # so recognition must come from the C2PA user type, not a substring scan.
+    data = _mp4_with_c2pa_manifest(purpose=b"merkle", data=bytes(range(1, 128)))
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(data)
+
+    report = inspect_av(src)
+    assert report.has_c2pa is True
+    assert any("content-provenance" in f for f in report.findings)
+
+
+def test_mp4_uuid_box_with_c2pa_bytes_at_invalid_offset_not_treated_as_manifest(tmp_path):
+    # A non-C2PA uuid box whose payload happens to hold the C2PA UUID at an
+    # invalid offset (1) must not be classified as a C2PA manifest box, and must
+    # survive a keep-mode clean (the old `uuid in payload[:20]` matched here).
+    bad_box = _isobmff_box(b"uuid", b"\x00" + C2PA_BMFF_UUID + b"not-a-manifest")
+    data = _mp4(bad_box, _isobmff_box(b"mdat", b"\x00" * 16))
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(data)
+
+    report = inspect_av(src)
+    assert report.has_c2pa is False
+
+    dest = tmp_path / "clip.cleaned.mp4"
+    result = clean_av(src, dest, strip_all_metadata=False)
+    assert C2PA_BMFF_UUID in dest.read_bytes()  # preserved in keep-mode
+    assert not any("content-provenance" in a for a in result["actions"])
+
+
+def test_mp4_c2pa_manifest_uuid_at_offset_4_still_detected(tmp_path):
+    # Accept the defensive FullBox layout (version/flags before the user type):
+    # the UUID is at payload offset 4 and must still be recognized.
+    data = _mp4(
+        _isobmff_box(b"uuid", b"\x00\x00\x00\x00" + C2PA_BMFF_UUID + b"manifest\x00" + b"data"),
+        _isobmff_box(b"mdat", b"\x00" * 16),
+    )
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(data)
+
+    report = inspect_av(src)
+    assert report.has_c2pa is True
+
+    dest = tmp_path / "clip.cleaned.mp4"
+    result = clean_av(src, dest, strip_all_metadata=False)
+    assert result["still_has_c2pa"] is False
+
+
+def test_c2pa_prov_box_scan_requires_uuid_fourcc():
+    # The whole-file fallback must only report C2PA when the UUID follows a
+    # `uuid` fourcc, not for a UUID-like byte sequence elsewhere (e.g. in mdat).
+    assert _contains_c2pa_prov_box(b"\x00" * 8 + b"uuid" + C2PA_BMFF_UUID + b"rest") is True
+    assert _contains_c2pa_prov_box(b"\x00" * 10 + C2PA_BMFF_UUID + b"\x00" * 10) is False
 
 
 # ---------------------------------------------------------------------------

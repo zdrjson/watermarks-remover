@@ -53,6 +53,8 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from av_meta import clean_av, inspect_av
+from clean_audio import audio_purify, is_audio_format, is_audio_name, media_has_video
+from clean_video import video_purify
 from common import (
     MAX_INPUT_BYTES,
     eprint,
@@ -89,6 +91,7 @@ ALLOWED_CLEAN_OPTIONS = {
     "keep_non_ai_metadata": bool,
     "also_layer_a_text": bool,
     "remove_pixel": str,
+    "remove_audio_watermark": bool,
     "strip_all_metadata": bool,
     "detect_before": bool,
     "detect_after": bool,
@@ -170,6 +173,7 @@ def capabilities() -> dict[str, Any]:
             "exiftool": _tool_usable("exiftool"),
             "qpdf": _tool_usable("qpdf"),
             "ghostscript": _ghostscript_usable(),
+            "ffmpeg": _tool_usable("ffmpeg"),
         },
         "pixel_backends": {
             "ctrlregen": bool(os.environ.get("NOAI_WATERMARK_DIR")),
@@ -260,7 +264,7 @@ _OPENAPI_PATHS: dict[str, dict[str, Any]] = {
                             type="object",
                             properties={
                                 k: _schema(type="boolean")
-                                for k in ("c2patool", "exiftool", "qpdf", "ghostscript")
+                                for k in ("c2patool", "exiftool", "qpdf", "ghostscript", "ffmpeg")
                             },
                         ),
                         "pixel_backends": _schema(
@@ -705,7 +709,10 @@ def _inspect_payload(data: bytes, name: str, run_detect: bool) -> dict[str, Any]
     suspicious = (
         bool(report.get("suspicious_total"))
         or bool(report.get("has_c2pa") or report.get("has_ai_metadata"))
-        or bool(report.get("stylometry", {}).get("score", 0.0) >= 0.65)
+        or bool(
+            report.get("stylometry", {}).get("status") == "ok"
+            and (report.get("stylometry", {}).get("score") or 0.0) >= 0.65
+        )
         or detected_wm
     )
     return {"ok": True, "kind": kind, "report": report, "suspicious": suspicious}
@@ -824,7 +831,65 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
             strip_all = not bool(options.get("keep_non_ai_metadata"))
             if "strip_all_metadata" in options:
                 strip_all = bool(options["strip_all_metadata"])
+            remove_pixel = options.get("remove_pixel")
+            if remove_pixel not in (None, "ctrlregen", "diffusion"):
+                raise ValueError("remove_pixel must be one of: ctrlregen, diffusion")
             result = clean_av(src, dest, strip_all_metadata=strip_all)
+            # Only run the audio chain on audio-only media. WAV/MP3/FLAC are
+            # definitive audio containers (no video stream possible); the
+            # MP4-family/OGG audio names (.m4a/.aac/.ogg/.opus) could be a
+            # mislabeled video, so only treat those as audio when a stream probe
+            # confirms there is no video track (an inconclusive probe is not
+            # "no video", to avoid dropping a video track via the -vn re-encode).
+            definitely_audio = is_audio_format(result.get("format", ""))
+            is_audio = definitely_audio or (is_audio_name(name) and media_has_video(src) is False)
+            if is_audio and options.get("remove_audio_watermark"):
+                audio_dest = _tmp_path(tmpdir, "out.m4a")
+                audio_res = audio_purify(dest, audio_dest)
+                result["audio_mark_removal"] = audio_res
+                if audio_res.get("available"):
+                    dest = audio_dest
+                    result["actions"].append(
+                        f"destructive audio watermark chain (tempo {audio_res.get('tempo')}x, "
+                        f"{audio_res.get('pitch_semitones'):+.1f} semitones, "
+                        f"{audio_res.get('codec')})"
+                    )
+                    # The chain re-encodes to M4A, so the metadata-clean report
+                    # fields are stale; recompute them from the final file and
+                    # reflect the new container, not the source format.
+                    after = inspect_av(dest)
+                    result["format"] = after.format
+                    result["bytes_out"] = dest.stat().st_size
+                    result["changed"] = True
+                    result["still_has_c2pa"] = after.has_c2pa
+                    result["still_has_ai_metadata"] = after.has_ai_metadata
+                    result["post_findings"] = after.findings
+                else:
+                    result["actions"].append(
+                        "destructive audio watermark chain skipped: "
+                        f"{audio_res.get('error', 'unknown error')}"
+                    )
+            elif remove_pixel:
+                pix = video_purify(dest, dest, remove_pixel=remove_pixel)
+                result["pixel_removal"] = pix
+                engine = "CtrlRegen" if remove_pixel == "ctrlregen" else "DiffusionPurification"
+                if pix.get("available"):
+                    result["actions"].append(
+                        f"{engine} per-frame video purification "
+                        f"({pix.get('frames_purified')}/{pix.get('frames_total')} frames)"
+                    )
+                    # The remux re-encodes the video, so the metadata-clean
+                    # report fields are stale; recompute them from the final file.
+                    after = inspect_av(dest)
+                    result["bytes_out"] = dest.stat().st_size
+                    result["changed"] = True
+                    result["still_has_c2pa"] = after.has_c2pa
+                    result["still_has_ai_metadata"] = after.has_ai_metadata
+                    result["post_findings"] = after.findings
+                else:
+                    result["actions"].append(
+                        f"per-frame video purification skipped: {pix.get('error', 'unknown error')}"
+                    )
             cleaned_bytes = dest.read_bytes()
             report = {"kind": "av", **result}
         else:
