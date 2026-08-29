@@ -88,6 +88,7 @@ MAX_BATCH_FILES = int(os.environ.get("WATERMARKS_MAX_BATCH_FILES", "50"))
 ALLOWED_CLEAN_OPTIONS = {
     "nfkc": bool,
     "aggressive_homoglyphs": bool,
+    "normalize_spaces": bool,
     "keep_non_ai_metadata": bool,
     "also_layer_a_text": bool,
     "remove_pixel": str,
@@ -132,7 +133,13 @@ def _json_ok(payload: dict[str, Any]) -> bytes:
 
 # Flag that makes each tool print its version and exit 0. They disagree:
 # exiftool treats `--version` as an unknown option and prints usage instead.
-_VERSION_FLAG = {"c2patool": "--version", "exiftool": "-ver", "qpdf": "--version"}
+_VERSION_FLAG = {
+    "c2patool": "--version",
+    "exiftool": "-ver",
+    "qpdf": "--version",
+    # ffmpeg has no --version; it exits 8 and the probe read that as unusable.
+    "ffmpeg": "-version",
+}
 
 
 @cache
@@ -793,6 +800,7 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
                 text,
                 nfkc=bool(options.get("nfkc")),
                 aggressive_homoglyphs=bool(options.get("aggressive_homoglyphs")),
+                normalize_spaces=bool(options.get("normalize_spaces", True)),
             )
             if detect_after:
                 detector_reports["after"] = run_text_detectors(cleaned)
@@ -918,6 +926,7 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
                 fmt=container_fmt,
                 also_layer_a_text=bool(options.get("also_layer_a_text", True)),
                 deep_images=str(options.get("deep_images", "auto")),
+                normalize_spaces=bool(options.get("normalize_spaces", True)),
             )
             cleaned_bytes = dest.read_bytes()
             report = {"kind": "container", **result}
