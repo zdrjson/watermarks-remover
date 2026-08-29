@@ -43,6 +43,14 @@ jobs:
             # workflow 目录内的冲突一律取本 fork 版本；其余冲突走人工
             git checkout --ours -- .github/workflows 2>/dev/null || true
             git add -A -- .github/workflows 2>/dev/null || true
+            # .gitignore 冲突自动愈合：取上游版本，再追加 fork 固定块（gui/gitignore.fork）
+            if git diff --name-only --diff-filter=U | grep -qx ".gitignore"; then
+              git checkout --theirs -- .gitignore
+              printf '\n' >> .gitignore
+              cat gui/gitignore.fork >> .gitignore
+              git add .gitignore
+              echo "已自动愈合 .gitignore 冲突（上游版本＋fork 追加块）。"
+            fi
             if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
               echo "conflict=true" >> "$GITHUB_OUTPUT"
               git merge --abort || true

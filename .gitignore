@@ -16,8 +16,6 @@
 !/service/**
 !/skills/remove-ai-marks/
 !/skills/remove-ai-marks/**
-!/gui/
-!/gui/**
 !/tests/
 !/tests/**
 !/.coderabbit.yaml
@@ -47,3 +45,12 @@
 posts.md
 *.cleaned.*
 *.bak
+
+# ---- fork additions: keep this block last (auto-re-appended by sync on conflicts) ----
+!/gui/
+!/gui/**
+gui/**/__pycache__/
+gui/**/*.pyc
+gui/**/*.cleaned.*
+gui/**/*.bak
+gui/.env

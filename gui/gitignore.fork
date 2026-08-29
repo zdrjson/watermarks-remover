@@ -1,0 +1,8 @@
+# ---- fork additions: keep this block last (auto-re-appended by sync on conflicts) ----
+!/gui/
+!/gui/**
+gui/**/__pycache__/
+gui/**/*.pyc
+gui/**/*.cleaned.*
+gui/**/*.bak
+gui/.env
