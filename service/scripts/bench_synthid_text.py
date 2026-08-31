@@ -52,7 +52,7 @@ from urllib.parse import urlparse
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from common import eprint, subprocess_creationflags  # noqa: E402
+from common import eprint, safe_arg, subprocess_creationflags  # noqa: E402
 from detect_text_watermark import SCHEMES  # noqa: E402  (single source of scheme names)
 from rewrite_text import _lexical_divergence  # noqa: E402
 from text_unicode import clean_text  # noqa: E402
@@ -106,7 +106,82 @@ def parse_variants(spec: str) -> list[tuple[str, int]]:
     return variants
 
 
+def parse_recipe(spec: str) -> list[tuple[str, float]]:
+    """Parse a recipe spec like 'chunk@0.6,paraphrase@0.3,humanize@1.0'.
+
+    Returns an ordered list of (strength, intensity) steps. Validates strength
+    names and that intensity lies in (0,1].
+    """
+    steps: list[tuple[str, float]] = []
+    known = {"paraphrase", "backtranslate", "structural", "humanize", "chunk"}
+    for raw in spec.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        if "@" not in item:
+            raise SystemExit(f"error: bad recipe step {item!r}; expected strength@intensity")
+        strength, raw_level = item.rsplit("@", 1)
+        strength = strength.strip()
+        try:
+            level = float(raw_level)
+        except ValueError:
+            raise SystemExit(f"error: bad intensity in recipe step {item!r}") from None
+        if strength not in known:
+            raise SystemExit(f"error: unknown recipe strength {strength!r}")
+        if not (0 < level <= 1):
+            raise SystemExit(f"error: recipe intensity must be in (0,1], got {level} in {item!r}")
+        steps.append((strength, level))
+    if not steps:
+        raise SystemExit("error: empty recipe")
+    if all(strength == "humanize" for strength, _ in steps):
+        raise SystemExit(
+            "error: recipe has only humanize steps; style polish is not a removal attempt"
+        )
+    return steps
+
+
+def parse_float_grid(spec: str) -> list[float]:
+    """Parse comma-separated floats in (0, 1] into a list."""
+    out: list[float] = []
+    for raw in spec.split(","):
+        x = raw.strip()
+        if not x:
+            continue
+        try:
+            val = float(x)
+        except ValueError:
+            raise SystemExit(f"error: bad float {x!r} in grid") from None
+        if not (0 < val <= 1):
+            raise SystemExit(f"error: intensity must be in (0,1], got {val}")
+        out.append(val)
+    if not out:
+        raise SystemExit("error: empty intensity grid")
+    return out
+
+
+def parse_weight_grid(spec: str) -> list[tuple[float, float, float]]:
+    """Parse comma-separated weight triples (a/b/c) summing to 1.0."""
+    out: list[tuple[float, float, float]] = []
+    for raw in spec.split(","):
+        parts = raw.strip().split("/")
+        if len(parts) != 3:
+            raise SystemExit(f"error: bad weight vector {raw!r}; expected a/b/c")
+        try:
+            w = tuple(float(x) for x in parts)
+        except ValueError:
+            raise SystemExit(f"error: non-numeric weight component in {raw!r}") from None
+        if not all(math.isfinite(c) for c in w):
+            raise SystemExit(f"error: weight vector {raw!r} must be finite")
+        if any(c < 0.0 for c in w):
+            raise SystemExit(f"error: weight vector {raw!r} must be non-negative")
+        if abs(sum(w) - 1.0) > 1e-6:
+            raise SystemExit(f"error: weight vector {raw!r} does not sum to 1.0")
+        out.append((w[0], w[1], w[2]))  # type: ignore[assignment]
+    return out
+
+
 def _base_url_is_loopback(base_url: str) -> bool:
+    """Check if base URL points to localhost/loopback address."""
     host = urlparse(base_url).hostname or ""
     return host in LOOPBACK_HOSTS
 
@@ -121,6 +196,7 @@ def _venv_python(upstream: Path) -> Path | None:
 
 
 def _markllm_commit(upstream: Path) -> str | None:
+    """Resolve current git commit SHA of MarkLLM repository."""
     git = which("git")
     if git is None:
         return None
@@ -141,6 +217,7 @@ def _markllm_commit(upstream: Path) -> str | None:
 
 
 def _repo_commit() -> str | None:
+    """Resolve current git commit SHA of watermarks-remover repository."""
     git = which("git")
     if git is None:
         return None
@@ -167,6 +244,7 @@ def _run_cmd(cmd: list[str], *, timeout: float) -> subprocess.CompletedProcess[s
     # 4 GiB child cap kills CUDA init and the 5 GB fp32 model). This matches
     # text_detectors.py, which applies no address-space cap to MarkLLM by
     # default.
+    """Run subprocess command with timeout and error capture."""
     return subprocess.run(
         cmd,
         capture_output=True,
@@ -261,6 +339,7 @@ def run_watermark(
 
 
 def _unlink(path: str) -> None:
+    """Safely remove a file if it exists."""
     with contextlib.suppress(OSError):
         os.unlink(path)
 
@@ -340,6 +419,7 @@ def run_rewrite(
     markllm_scheme: str,
     rewrite_level: float | None = None,
     target_margin: float = 0.0,
+    noop_lex_floor: float | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Run the Layer B rewrite on *text* via rewrite_text.py (real product path).
 
@@ -393,6 +473,8 @@ def run_rewrite(
         cmd += ["--rewrite-level", str(rewrite_level)]
     if target_margin:
         cmd += ["--target-margin", str(target_margin)]
+    if noop_lex_floor is not None:
+        cmd += ["--noop-lex-floor", safe_arg(str(noop_lex_floor))]
     if allow_remote:
         cmd.append("--allow-remote")
     try:
@@ -434,6 +516,7 @@ def load_corpus(path: Path, limit: int) -> list[tuple[str, str]]:
 
 
 def _numbers_preserved(original: str, candidate: str) -> float:
+    """Check if numbers from original text are retained in candidate."""
     a = set(re.findall(r"\d+", original))
     if not a:
         return 1.0
@@ -442,6 +525,7 @@ def _numbers_preserved(original: str, candidate: str) -> float:
 
 
 def _urls_preserved(original: str, candidate: str) -> float:
+    """Check if URLs from original text are retained in candidate."""
     a = set(re.findall(r"https?://\S+", original))
     if not a:
         return 1.0
@@ -450,6 +534,7 @@ def _urls_preserved(original: str, candidate: str) -> float:
 
 
 def estimate_tokens(text: str, chars_per_token: float) -> int:
+    """Estimate token count from character length."""
     return max(1, int(len(text) / max(chars_per_token, 1.0)))
 
 
@@ -459,6 +544,7 @@ def estimate_tokens(text: str, chars_per_token: float) -> int:
 
 
 def _detect_positive(d: dict[str, Any] | None) -> bool:
+    """Check if watermark detection report verdict is positive."""
     return bool(d and d.get("available") and d.get("is_watermarked"))
 
 
@@ -472,6 +558,7 @@ class SemanticEmbedder:
     """
 
     def __init__(self, model_name: str) -> None:
+        """init."""
         self._model_name = model_name
         self._model = None
         self._util = None
@@ -480,6 +567,7 @@ class SemanticEmbedder:
     def _load(self):
         # Fail-soft: a prior load OR encode failure disables the backend so we
         # stop retrying a failing model/encode instead of looping on it.
+        """load."""
         if self._failed is not None:
             return None
         if self._model is not None:
@@ -495,6 +583,7 @@ class SemanticEmbedder:
         return self._model
 
     def available(self) -> bool:
+        """Available."""
         return self._load() is not None
 
     def reason(self) -> str | None:
@@ -505,6 +594,7 @@ class SemanticEmbedder:
         return self._failed
 
     def score(self, original: str, candidate: str) -> float | None:
+        """Score."""
         model = self._load()
         if model is None:
             return None
@@ -516,9 +606,216 @@ class SemanticEmbedder:
             return None
 
 
+class HumanLikeness:
+    """Human-likeness axis: stylometry (always on) or an optional detector.
+
+    ``score(text)`` returns AI-likeness in [0,1] (lower = more human);
+    ``human_like = 1 - score``. Backends:
+
+    - 'stylometry' (default): stdlib-only burstiness/MATTR/AI-phrase gauge.
+    - 'lastde'/'binoculars': an offline ``ai_human.py`` module in
+      ``--human-detector-dir`` exposing ``score(text) -> float``.
+    - 'pangram': the Pangram Labs async **bulk** API (``--human-pangram-model``,
+      API key in ``PANGRAM_API_KEY``). Batching is via ``score_many`` (one bulk
+      job per call); ``score`` is a one-item bulk job.
+
+    A backend that fails to load or run degrades to stylometry, reported via
+    ``reason()``. Stylometry returns ``None`` (uncalibrated) below
+    ``MIN_SAMPLE_WORDS`` words; the caller excludes those from averages.
+    """
+
+    PANGRAM_BASE_URL = "https://text.external-api.pangram.com"
+
+    def __init__(
+        self, backend: str, detector_dir: str | None = None, pangram_model: str | None = None
+    ) -> None:
+        """HumanLikeness."""
+        self.backend = backend
+        self.detector_dir = detector_dir
+        self.pangram_model = pangram_model or "pangram-4"
+        self.backend_used = "stylometry"
+        self._failed: str | None = None
+        self._detector = None
+        self._pangram_key: str | None = None
+        self._pangram_models: list[str] | None = None
+        self._load()
+
+    def _load(self) -> None:
+        """Load the requested backend (fail-soft to stylometry)."""
+        if self.backend == "stylometry":
+            return
+        if self.backend == "pangram":
+            key = os.environ.get("PANGRAM_API_KEY")
+            if not key:
+                self._failed = "PANGRAM_API_KEY not set"
+                return
+            self._pangram_key = key
+            try:
+                models = self._pangram_request("GET", "/models") or {}
+                self._pangram_models = list(models.get("models") or [])
+            except Exception as e:  # fail-soft: auth / network / bad key
+                self._pangram_key = None
+                self._failed = f"pangram unavailable: {e}"
+                return
+            allowed = self._pangram_models
+            if self.pangram_model not in allowed:
+                self.pangram_model = (
+                    "default" if "default" in allowed else (allowed[0] if allowed else None)
+                )
+                if self.pangram_model is None:
+                    self._failed = f"no pangram model available ({allowed})"
+                    return
+            self._pangram_key = key
+            self.backend_used = "pangram"
+            return
+        if not self.detector_dir:
+            self._failed = f"{self.backend} requires --human-detector-dir"
+            return
+        try:
+            import importlib.util
+
+            path = Path(self.detector_dir) / "ai_human.py"
+            spec = importlib.util.spec_from_file_location("ai_human", path)
+            if spec is None or spec.loader is None:
+                raise ImportError("no ai_human.py loader")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            self._detector = mod.score
+            self.backend_used = self.backend
+        except Exception as e:  # fail-soft: optional detector backend
+            self._failed = f"{self.backend} detector unavailable: {e}"
+
+    def available(self) -> bool:
+        """Available."""
+        return True  # a fallback always scores
+
+    def reason(self) -> str | None:
+        """Reason."""
+        return self._failed
+
+    def _pangram_request(self, method: str, path: str, body: dict | None = None) -> dict:
+        """Talk to the Pangram text API over https (no shell; urllib only)."""
+        import urllib.request
+
+        url = self.PANGRAM_BASE_URL + path
+        if not (url.startswith("https://") or url.startswith("http://")):
+            raise ValueError(f"refusing non-http(s) pangram endpoint: {url}")
+        req = urllib.request.Request(url, method=method)  # noqa: S310 - scheme checked above
+        req.add_header("x-api-key", self._pangram_key or "")
+        req.add_header("Content-Type", "application/json")
+        if body is not None:
+            req.data = json.dumps(body).encode("utf-8")
+        with urllib.request.urlopen(req, timeout=30.0) as resp:  # noqa: S310
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _stylometry(self, text: str) -> float | None:
+        """Stdlib stylometry score."""
+        try:
+            from score_stylometry import score_text_stylometry
+
+            rep = score_text_stylometry(text)
+            if rep.score is None:
+                return None
+            return round(float(rep.score), 4)
+        except Exception as e:
+            self._failed = f"stylometry failed: {e}"
+            return None
+
+    def _pangram_answer_score(self, result: dict | None) -> float | None:
+        """AI-likeness from a Pangram result: 1 - fraction_human (fallback fraction_ai)."""
+        if not isinstance(result, dict):
+            return None
+        fh = result.get("fraction_human")
+        if isinstance(fh, (int, float)):
+            return round(min(1.0, max(0.0, 1.0 - float(fh))), 4)
+        fa = result.get("fraction_ai")
+        if isinstance(fa, (int, float)):
+            return round(min(1.0, max(0.0, float(fa))), 4)
+        return None
+
+    def score_many(self, texts: list[str]) -> list[float | None]:
+        """Score many texts; the Pangram backend uses one async bulk job.
+
+        Non-Pangram backends fall back to per-text ``score``.
+        """
+        if self._pangram_key and self.backend_used == "pangram":
+            try:
+                return self._pangram_batch(texts)
+            except Exception as e:  # fail-soft: disable pangram, fall back to stylometry
+                self._failed = f"pangram error: {e}"
+                self.backend_used = "stylometry"
+                self._pangram_key = None
+        return [self.score(t) for t in texts]
+
+    def _pangram_batch(self, texts: list[str]) -> list[float | None]:
+        """Submit/poll/fetch one bulk job covering all texts; align results by id."""
+        import time
+
+        index_of: dict[str, int] = {}
+        items: list[dict] = []
+        for i, t in enumerate(texts):
+            if not t or not t.strip():
+                continue
+            index_of[str(i)] = i
+            items.append({"id": str(i), "text": t})
+        if not items:
+            return [None] * len(texts)
+        submit = self._pangram_request(
+            "POST", "/bulk", {"items": items, "model": self.pangram_model}
+        )
+        bulk_id = submit.get("bulk_id")
+        if not bulk_id:
+            raise RuntimeError(f"pangram bulk submit returned no bulk_id: {submit}")
+        deadline = time.monotonic() + 60.0  # overall wait before giving up
+        while True:
+            st = self._pangram_request("GET", f"/bulk/{bulk_id}")
+            status = st.get("status")
+            if status in ("succeeded", "failed", "partial"):
+                break
+            if time.monotonic() > deadline:
+                raise TimeoutError("pangram bulk job timed out")
+            time.sleep(2.0)
+        if status == "failed":
+            # Every item failed; trigger score_many's stylometry fallback.
+            raise RuntimeError("pangram bulk job failed (all items failed)")
+        scores: dict[str, float | None] = {}
+        offset = 0
+        while True:
+            page = self._pangram_request(
+                "GET", f"/bulk/{bulk_id}/results?offset={offset}&limit=1000"
+            )
+            entries = page.get("items") or page.get("results") or []
+            if not entries:
+                break
+            for entry in entries:
+                id_ = str(
+                    entry.get("id") if entry.get("id") is not None else entry.get("index") or ""
+                )
+                scores[id_] = self._pangram_answer_score(entry.get("result"))
+            if len(entries) < 1000:
+                break
+            offset += len(entries)
+        return [scores.get(str(i)) for i in range(len(texts))]
+
+    def score(self, text: str) -> float | None:
+        """Score human-likeness of a single text."""
+        if self._pangram_key and self.backend_used == "pangram":
+            return self.score_many([text])[0]
+        if self._detector is not None:
+            try:
+                v = self._detector(text)
+                return round(float(v), 4) if isinstance(v, (int, float)) else None
+            except Exception as e:
+                self._detector = None
+                self.backend_used = "stylometry"
+                self._failed = f"detector error: {e}"
+        return self._stylometry(text)
+
+
 def _quality(
     original: str, candidate: str, chars_per_token: float, semantic: SemanticEmbedder | None = None
 ) -> dict[str, Any]:
+    """Compute quality metrics between original and rewritten text."""
     sem = semantic.score(original, candidate) if semantic is not None else None
     return {
         "lexical_divergence": round(_lexical_divergence(original, candidate), 4),
@@ -532,6 +829,7 @@ def _quality(
 
 
 def _score_of(d: dict[str, Any] | None) -> float | None:
+    """Extract primary score from detection result."""
     if not d or not d.get("available"):
         return None
     s = d.get("score")
@@ -557,6 +855,7 @@ class MarkLLMWorker:
         scheme: str,
         config: str | None,
     ) -> None:
+        """init."""
         self._timeout = timeout
         cmd = [
             python,
@@ -599,15 +898,18 @@ class MarkLLMWorker:
             os.environ["WATERMARKS_MARKLLM_PORT"] = str(self.port)
 
     def _drain_stderr(self) -> None:
+        """drain stderr."""
         for line in self._proc.stderr:
             self._stderr_tail.append(line.rstrip())
             if len(self._stderr_tail) > 200:
                 self._stderr_tail.pop(0)
 
     def _read_line(self, timeout: float) -> dict[str, Any] | None:
+        """read line."""
         q: queue.Queue[str] = queue.Queue()
 
         def _reader() -> None:
+            """reader."""
             try:
                 q.put(self._proc.stdout.readline())
             except Exception as e:
@@ -630,6 +932,7 @@ class MarkLLMWorker:
         return data if isinstance(data, dict) else None
 
     def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """request."""
         try:
             self._proc.stdin.write(json.dumps(payload) + "\n")
             self._proc.stdin.flush()
@@ -642,6 +945,7 @@ class MarkLLMWorker:
         return resp
 
     def watermark(self, prompt: str, seed: int, max_new_tokens: int) -> dict[str, Any]:
+        """Watermark."""
         resp = self._request(
             {
                 "op": "watermark",
@@ -660,6 +964,7 @@ class MarkLLMWorker:
         }
 
     def detect(self, text: str) -> dict[str, Any]:
+        """Detect."""
         resp = self._request({"op": "detect", "id": 0, "text": text})
         return {
             "available": True,
@@ -669,6 +974,7 @@ class MarkLLMWorker:
         }
 
     def close(self) -> None:
+        """Close."""
         os.environ.pop("WATERMARKS_MARKLLM_PORT", None)
         if self._proc.poll() is None:
             try:
@@ -686,6 +992,7 @@ class MarkLLMWorker:
 
 class Benchmark:
     def __init__(self, args: argparse.Namespace, upstream: Path) -> None:
+        """init."""
         self.args = args
         self.upstream = upstream
         self.script = SCRIPTS_DIR / "detect_text_watermark.py"
@@ -695,6 +1002,9 @@ class Benchmark:
         self.corpus = load_corpus(args.corpus, args.docs)
         self.chars_per_token = args.chars_per_token
         self.semantic = SemanticEmbedder(args.semantic_model)
+        self.human = HumanLikeness(
+            args.human_backend, args.human_detector_dir, pangram_model=args.human_pangram_model
+        )
         self.scheme = args.scheme
         self.config = args.config
         self.worker = None
@@ -714,17 +1024,20 @@ class Benchmark:
                 eprint(f"markllm worker unavailable, using one-shot subprocesses: {e}")
 
     def _drop_worker(self) -> None:
+        """drop worker."""
         if self.worker is not None:
             with contextlib.suppress(Exception):
                 self.worker.close()
         self.worker = None
 
     def close_worker(self) -> None:
+        """Close worker."""
         self._drop_worker()
 
     # -- step wrappers (monkeypatchable in tests) --------------------------
 
     def watermark_sample(self, prompt_path: Path, seed: int, out_dir: Path) -> dict[str, Any]:
+        """Watermark sample."""
         if self.worker is not None:
             prompt = prompt_path.read_text(encoding="utf-8", errors="surrogateescape")
             try:
@@ -747,6 +1060,7 @@ class Benchmark:
         )
 
     def detect(self, text: str) -> dict[str, Any]:
+        """Detect."""
         if self.worker is not None:
             try:
                 return self.worker.detect(text)
@@ -773,6 +1087,7 @@ class Benchmark:
         rewrite_level: float | None = None,
         target_margin: float = 0.0,
     ) -> tuple[str, dict[str, Any]]:
+        """Execute text rewrite pass across candidates and select best candidate."""
         a = self.args
         return run_rewrite(
             self.python,
@@ -794,6 +1109,7 @@ class Benchmark:
             markllm_scheme=self.scheme,
             rewrite_level=rewrite_level,
             target_margin=target_margin,
+            noop_lex_floor=a.noop_lex_floor,
         )
 
     # -- phases ------------------------------------------------------------
@@ -922,6 +1238,8 @@ class Benchmark:
                             "after_pos": None,
                             "score_after": None,
                             "margin": None,
+                            "noop": False,
+                            "robust_cleared": False,
                             "notes": [f"rewrite failed: {e}"],
                         }
                     )
@@ -937,6 +1255,8 @@ class Benchmark:
                             "after_pos": None,
                             "score_after": None,
                             "margin": None,
+                            "noop": False,
+                            "robust_cleared": False,
                             "notes": ["rewrite markllm verification unavailable"],
                         }
                     )
@@ -974,6 +1294,24 @@ class Benchmark:
                     )
                     if k in stats
                 }
+                # No-op guard: a near-verbatim output is not a removal attempt.
+                # Do not report it as "0% clear" (the misleading backtranslate
+                # case) — set cleared=None and exclude it from the clear rate.
+                if stats.get("noop"):
+                    row["noop"] = True
+                    row["cleared"] = None
+                    row["after_pos"] = None
+                    row["score_after"] = None
+                    row["margin"] = None
+                    row["notes"] = [
+                        *(row.get("notes") or []),
+                        "rewrite returned ≈ input (no-op); not a valid removal test",
+                    ]
+                row["robust_cleared"] = bool(
+                    row["cleared"] is True
+                    and row.get("margin") is not None
+                    and row["margin"] >= self.args.target_margin - 1e-9
+                )
                 rows.append(row)
 
             # Optional re-stamp control: rewrite the UNwatermarked text; a
@@ -996,6 +1334,8 @@ class Benchmark:
                                 "variant": variant,
                                 "kind": "restamp",
                                 "cleared": None,
+                                "noop": False,
+                                "robust_cleared": False,
                                 "notes": [f"rewrite failed: {e}"],
                             }
                         )
@@ -1010,6 +1350,8 @@ class Benchmark:
                             "score_after": _score_of(after),
                             "margin": self._score_margin(after),
                             "cleared": None,
+                            "noop": False,
+                            "robust_cleared": False,
                             "quality": _quality(
                                 sample["unwatermarked"],
                                 out_text,
@@ -1048,6 +1390,7 @@ class Benchmark:
         # Rewrite variants already get after-detection from the rewrite's
         # --json-stats; running another MarkLLM detect here would waste a
         # model load per document.
+        """row."""
         started = time.monotonic()
         after = self.detect(candidate) if detect_after else None
         seconds = round(time.monotonic() - started, 3) if detect_after else 0.0
@@ -1068,11 +1411,19 @@ class Benchmark:
             "seconds": seconds,
             "usd": 0.0,
             "notes": [],
+            "noop": False,
+            "ai_style_score": self.human.score(candidate),
+            "human_backend": self.human.backend_used,
         }
         if kind == "control":
             row["notes"].append("no removal applied (baseline)")
         elif kind == "layer-a":
             row["notes"].append("Layer A only; statistical marks are expected to survive")
+        row["robust_cleared"] = bool(
+            cleared is True
+            and row.get("margin") is not None
+            and row["margin"] >= self.args.target_margin - 1e-9
+        )
         return row
 
     def _rewrite_report(self, stats: dict[str, Any], out_text: str) -> dict[str, Any]:
@@ -1190,6 +1541,10 @@ class Benchmark:
                     except RuntimeError as e:
                         failed = str(e)
                         break
+                    if stats.get("noop"):
+                        # A level that returned ≈ the input is not a real removal;
+                        # it must never be the minimal clearing level.
+                        continue
                     report = self._rewrite_report(stats, out_text)
                     verdict = self._cleared_verdict(report)
                     if verdict is None:
@@ -1285,6 +1640,201 @@ class Benchmark:
             rows.append(row)
         return rows
 
+    # -- recipe mode --------------------------------------------------------
+
+    def compose_recipe(
+        self, text: str, steps: list[tuple[str, float]], target_margin: float
+    ) -> tuple[str, dict[str, Any]]:
+        """Apply an ordered recipe: each (strength, intensity) step is one rewrite,
+        feeding the previous output as the next input. Returns (final_text, stats)
+        where stats is the last step's rewrite stats (carrying markllm before/after)."""
+        current = text
+        stats: dict[str, Any] = {}
+        for _i, (strength, level) in enumerate(steps):
+            current, stats = self.rewrite(
+                current, strength, 1, rewrite_level=level, target_margin=target_margin
+            )
+        if self.args.layer_a_after:
+            current, _layer = clean_text(current)
+        return current, stats
+
+    def _eval_recipe(self, recipe: list[tuple[str, float]], samples: list[dict[str, Any]]) -> dict:
+        """Score one recipe across all non-excluded watermarked samples.
+
+        Axes: robust_clear_rate (↑), sem_div (↓), human_like (↑). A sample
+        counts only if it was detected positive before, and only if the recipe's
+        final markllm after-report is available.
+        """
+        rows_in: list[dict[str, Any]] = []
+        outs: list[str] = []
+        score_at: list[int] = []
+        for s in samples:
+            if s.get("excluded"):
+                continue
+            orig = s["watermarked"]
+            if not _detect_positive(s.get("before")):
+                continue
+            try:
+                out, stats = self.compose_recipe(orig, recipe, self.args.target_margin)
+            except RuntimeError as e:
+                rows_in.append({"robust": None, "sem": None, "human": None, "err": str(e)})
+                continue
+            mk = (stats.get("markllm") or {}).get("after") if stats else None
+            if not (mk or {}).get("available"):
+                rows_in.append({"robust": None, "sem": None, "human": None})
+                continue
+            cleared = (stats.get("markllm") or {}).get("cleared")
+            if cleared is None:
+                cleared = bool(_detect_positive(s.get("before")) and not _detect_positive(mk))
+            margin = self._score_margin(mk)
+            robust = bool(
+                cleared is True and margin is not None and margin >= self.args.target_margin - 1e-9
+            )
+            sem = self.semantic.score(orig, out) if self.semantic is not None else None
+            rows_in.append({"robust": robust, "sem": sem, "human": None})
+            outs.append(out)
+            score_at.append(len(rows_in) - 1)
+        if outs:
+            # Batch the human-likeness scoring (one Pangram bulk job per recipe).
+            scored = self.human.score_many(outs)
+            for idx, val in zip(score_at, scored, strict=True):
+                rows_in[idx]["human"] = val
+        verified = [r for r in rows_in if r["robust"] is not None]
+        n = len(verified)
+        unverified = len(rows_in) - n
+        if n == 0:
+            return {
+                "robust_clear_rate": None,
+                "sem_div": None,
+                "human_like": None,
+                "n": 0,
+                "unverified": unverified,
+            }
+        rob = sum(1 for r in verified if r["robust"]) / n
+        sem_vals = [r["sem"] for r in verified if r.get("sem") is not None]
+        hum_vals = [r["human"] for r in verified if r.get("human") is not None]
+        return {
+            "robust_clear_rate": round(rob, 4),
+            "sem_div": round(_mean(sem_vals), 4) if sem_vals else None,
+            "human_like": round(1.0 - _mean(hum_vals), 4) if hum_vals else None,
+            "n": n,
+            "unverified": unverified,
+        }
+
+    def _scalarize(self, axis: dict, w: tuple[float, float, float]) -> float | None:
+        """Scalarize an axis dict under weight vector w."""
+        return _weighted_score(axis, w)
+
+    def recipe_search(self, samples: list[dict[str, Any]], workdir: Path) -> dict[str, Any]:
+        """Recipe search.
+
+        Phase 1 sweeps each strength's intensity grid as a single-step recipe.
+        Phase 2 runs a per-weight-vector beam search that combines an *order* of
+        strengths with the top `--phase2-levels-per-strength` intensities for that
+        weight vector, so both step order and intensity are explored. The
+        recommended recipe is the point on the weight-independent Pareto frontier
+        that best matches `--recommend-weight`; the frontier itself is unaffected
+        by weights.
+        """
+        a = self.args
+        strengths: tuple[str, ...] = (
+            "paraphrase",
+            "backtranslate",
+            "structural",
+            "humanize",
+            "chunk",
+        )
+        grid = parse_float_grid(a.intensity_grid)
+        weights = parse_weight_grid(a.weight_grid)
+        recommend_w = parse_weight_vec(getattr(a, "recommend_weight", "0.5/0.3/0.2"))
+        k = max(1, int(getattr(a, "phase2_levels_per_strength", 3)))
+        evaluated: dict[tuple[tuple[str, float], ...], dict] = {}
+        cands: list[dict] = []
+
+        def _eval(recipe: list[tuple[str, float]]) -> dict | None:
+            """eval."""
+            key = tuple(recipe)
+            if key in evaluated:
+                return evaluated[key]
+            axis = self._eval_recipe(recipe, samples)
+            axis["steps"] = list(recipe)
+            cands.append(axis)
+            evaluated[key] = axis
+            return axis
+
+        # Phase 1: per-strength intensity sweep (single-step recipes).
+        step_axes: dict[tuple[str, float], dict] = {}
+        for strength in strengths:
+            for level in grid:
+                axis = _eval([(strength, level)])
+                if axis is not None:
+                    step_axes[(strength, level)] = axis
+
+        # Phase 2: per-weight top-k intensity ranking + intensity x order beam search.
+        for w in weights:
+            topk: dict[str, list[float]] = {}
+            for strength in strengths:
+                ranked: list[tuple[float, float]] = []
+                for (s, level), axis in step_axes.items():
+                    if s != strength:
+                        continue
+                    sc = self._scalarize(axis, w)
+                    if sc is not None:
+                        ranked.append((sc, level))
+                ranked.sort(key=lambda t: t[0], reverse=True)
+                topk[strength] = [level for _sc, level in ranked[:k]]
+
+            beams: list[list[tuple[str, float]]] = [
+                [(s, level)] for s in strengths for level in topk[s]
+            ]
+            for _depth in range(1, max(1, a.max_passes)):
+                candidates_beam: list[tuple[float, list]] = []
+                for recipe in beams:
+                    used = {s for s, _lv in recipe}
+                    for strength in strengths:
+                        if strength in used:
+                            continue
+                        for level in topk[strength]:
+                            cand = [*recipe, (strength, level)]
+                            axis = _eval(cand)
+                            if axis is None:
+                                continue
+                            sc = self._scalarize(axis, w)
+                            if sc is None:
+                                continue
+                            candidates_beam.append((sc, cand))
+                if not candidates_beam:
+                    break
+                candidates_beam.sort(key=lambda t: t[0], reverse=True)
+                beams = [cand for _sc, cand in candidates_beam[: a.beam]]
+
+        frontier = _pareto_frontier(cands)
+        recommended = _best_on_frontier(frontier, cands, recommend_w)
+
+        # Intensity curves per strength (from Phase 1 single-step recipes).
+        curves: dict[str, list] = {}
+        for strength in strengths:
+            curve = []
+            for c in cands:
+                if len(c.get("steps") or []) == 1 and c["steps"][0][0] == strength:
+                    curve.append(
+                        {
+                            "level": c["steps"][0][1],
+                            "robust_clear_rate": c["robust_clear_rate"],
+                            "sem_div": c["sem_div"],
+                            "human_like": c["human_like"],
+                        }
+                    )
+            curves[strength] = sorted(curve, key=lambda r: r["level"])
+
+        return {
+            "candidates": cands,
+            "recommended": recommended,
+            "frontier": frontier,
+            "intensity_curves": curves,
+            "verdict": _recipe_verdict(cands),
+        }
+
 
 # ---------------------------------------------------------------------------
 # Aggregation and outputs
@@ -1292,12 +1842,172 @@ class Benchmark:
 
 
 def _mean(values: list[float]) -> float | None:
+    """Calculate arithmetic mean of a numeric sequence."""
     if not values:
         return None
     return sum(values) / len(values)
 
 
+def _auc(pos: list[float], neg: list[float]) -> float | None:
+    """Rank-based (Mann-Whitney) area under the ROC curve.
+
+    An item is treated as positive when its detector score is *higher*; AUC is
+    the probability that a random positive outscores a random negative. 1.0 =
+    perfect separation, 0.5 = indistinguishable, 0.0 = perfectly inverted.
+    """
+    if not pos or not neg:
+        return None
+    n1 = len(pos)
+    n2 = len(neg)
+    values = sorted(pos + neg)
+    n = len(values)
+    rank_of: dict[float, float] = {}
+    i = 0
+    while i < n:
+        j = i
+        while j < n and values[j] == values[i]:
+            j += 1
+        avg = (i + 1 + j) / 2.0
+        for k in range(i, j):
+            rank_of[values[k]] = avg
+        i = j
+    rank_sum_pos = sum(rank_of[v] for v in pos if v in rank_of)
+    u = rank_sum_pos - n1 * (n1 + 1) / 2.0
+    return round(u / (n1 * n2), 4)
+
+
+def compute_auroc(
+    samples: list[dict[str, Any]], rows: list[dict[str, Any]], variants: list[tuple[str, int]]
+) -> dict[str, Any]:
+    """Population-level AUROC: baseline (orig wm vs plain) and per-variant post-removal.
+
+    Post-removal AUROC uses the rewritten/watermarked after-scores (rewrite-*)
+    vs the rewritten/unwatermarked after-scores (restamp-*); it needs
+    --restamp-control and degrades to None per variant when unavailable.
+    """
+    ok = [s for s in samples if not s.get("excluded")]
+    base_pos = [_score_of(s.get("before")) for s in ok]
+    base_pos = [v for v in base_pos if v is not None]
+    base_neg = [_score_of(s.get("plain_detect")) for s in ok]
+    base_neg = [v for v in base_neg if v is not None]
+    out: dict[str, Any] = {"baseline_auroc": _auc(base_pos, base_neg), "post": {}}
+    for strength, _c in variants:
+        key = f"rewrite-{strength}:{_c}"
+        restamp_key = f"restamp-{strength}:{_c}"
+        pos = [
+            r["score_after"]
+            for r in rows
+            if r.get("variant") == key and r.get("score_after") is not None
+        ]
+        neg = [
+            r["score_after"]
+            for r in rows
+            if r.get("variant") == restamp_key and r.get("score_after") is not None
+        ]
+        out["post"][key] = _auc(pos, neg)
+    return out
+
+
+def _pareto_frontier(cands: list[dict]) -> list[dict]:
+    """Non-dominated recipes over (robust_clear_rate ↑, sem_div ↓, human_like ↑).
+
+    Recipes missing any of the three axes are dropped (they cannot be ranked by
+    dominance). A recipe is dominated if another is at least as good on all three
+    and strictly better on at least one.
+    """
+    valid = [
+        c
+        for c in cands
+        if c.get("robust_clear_rate") is not None
+        and c.get("sem_div") is not None
+        and c.get("human_like") is not None
+    ]
+    front: list[dict] = []
+    for c in valid:
+        dominated = False
+        for o in valid:
+            if o is c:
+                continue
+            if (
+                o["robust_clear_rate"] >= c["robust_clear_rate"]
+                and o["sem_div"] <= c["sem_div"]
+                and o["human_like"] >= c["human_like"]
+                and (
+                    o["robust_clear_rate"] > c["robust_clear_rate"]
+                    or o["sem_div"] < c["sem_div"]
+                    or o["human_like"] > c["human_like"]
+                )
+            ):
+                dominated = True
+                break
+        if not dominated:
+            front.append(c)
+    return front
+
+
+def _weighted_score(axis: dict[str, Any], w: tuple[float, float, float]) -> float | None:
+    """Scalarize an axis dict into a single score under weight vector w.
+
+    A recipe is only scalarizable when all three axes are available; otherwise it
+    cannot be ranked and None is returned.
+    """
+    removal = axis.get("robust_clear_rate")
+    sem = axis.get("sem_div")
+    human = axis.get("human_like")
+    if removal is None or sem is None or human is None:
+        return None
+    return w[0] * removal + w[1] * (1.0 - sem) + w[2] * human
+
+
+def _best_on_frontier(
+    frontier: list[dict], cands: list[dict], w: tuple[float, float, float]
+) -> dict | None:
+    """Pick the Pareto-frontier recipe best under weight w.
+
+    Falls back to the best candidate under w if the frontier is empty (which can
+    happen when no recipe has all three axes available).
+    """
+    pool = frontier or cands
+    best: dict | None = None
+    best_sc: float | None = None
+    for c in pool:
+        sc = _weighted_score(c, w)
+        if sc is None:
+            continue
+        if best is None or sc > best_sc:
+            best, best_sc = c, sc
+    return best
+
+
+def _recipe_verdict(cands: list[dict]) -> str:
+    """Honest verdict on whether the searched recipes clear the mark.
+
+    'removable'    -> some recipe robustly cleared (best robust % == 1.0).
+    'partial'      -> recipes cleared partially (0 < best robust % < 1.0).
+    'resists'      -> nothing cleared (best robust % == 0.0).
+    'undetermined' -> no recipe was evaluable (all three axes missing).
+    """
+    rates = [c.get("robust_clear_rate") for c in cands if c.get("robust_clear_rate") is not None]
+    if not rates:
+        return "undetermined"
+    best_rate = max(rates)
+    if best_rate <= 0.0:
+        return "resists"
+    if best_rate < 1.0:
+        return "partial"
+    return "removable"
+
+
+def parse_weight_vec(spec: str) -> tuple[float, float, float]:
+    """Parse a single weight triple like '0.5/0.3/0.2' summing to 1.0."""
+    vecs = parse_weight_grid(spec)
+    if len(vecs) != 1:
+        raise SystemExit(f"error: expected exactly one weight vector, got {spec!r}")
+    return vecs[0]
+
+
 def aggregate(rows: list[dict[str, Any]], variants: list[tuple[str, int]]) -> dict[str, Any]:
+    """Aggregate benchmark run statistics across variants."""
     by_variant: dict[str, list[dict[str, Any]]] = {}
     order: list[str] = ["control", "layer-a"]
     order += [f"rewrite-{s}:{c}" for s, c in variants]
@@ -1313,8 +2023,11 @@ def aggregate(rows: list[dict[str, Any]], variants: list[tuple[str, int]]) -> di
             continue
         before_pos = sum(1 for r in group if r.get("before_pos"))
         cleared = sum(1 for r in group if r.get("cleared"))
+        robust = sum(1 for r in group if r.get("robust_cleared"))
+        noop_n = sum(1 for r in group if r.get("noop"))
         after_pos = sum(1 for r in group if r.get("after_pos"))
         clear_rate = cleared / before_pos if before_pos else None
+        robust_clear_rate = robust / before_pos if before_pos else None
         deltas = [
             (r["score_before"] - r["score_after"])
             for r in group
@@ -1329,12 +2042,20 @@ def aggregate(rows: list[dict[str, Any]], variants: list[tuple[str, int]]) -> di
         scores_before = [r["score_before"] for r in group if r.get("score_before") is not None]
         scores_after = [r["score_after"] for r in group if r.get("score_after") is not None]
         margins = [r["margin"] for r in group if r.get("margin") is not None]
+        human_scores = [r["ai_style_score"] for r in group if r.get("ai_style_score") is not None]
         entries: dict[str, Any] = {
             "n": len(group),
             "before_positive": before_pos,
             "after_positive": after_pos,
             "cleared": cleared,
             "clear_rate": round(clear_rate, 4) if clear_rate is not None else None,
+            "robust_cleared": robust,
+            "robust_clear_rate": round(robust_clear_rate, 4)
+            if robust_clear_rate is not None
+            else None,
+            "noop_n": noop_n,
+            "human_n": len(human_scores),
+            "mean_ai_style_score": round(_mean(human_scores), 4) if human_scores else None,
             "mean_score_before": round(_mean(scores_before), 4) if scores_before else None,
             "mean_score_after": round(_mean(scores_after), 4) if scores_after else None,
             "mean_margin": round(_mean(margins), 4) if margins else None,
@@ -1427,6 +2148,7 @@ def aggregate_minimal(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _fmt(value: Any, default: str = "—") -> str:
+    """Format numeric value for markdown table output."""
     if value is None:
         return default
     if isinstance(value, float):
@@ -1439,7 +2161,9 @@ def render_markdown(
     samples: list[dict[str, Any]],
     rows: list[dict[str, Any]],
     agg: dict[str, Any],
+    auroc: dict[str, Any] | None = None,
 ) -> str:
+    """Render benchmark results summary as markdown report."""
     L: list[str] = []
     L.append(f"# SynthID-text removal benchmark — {config['tag']}")
     L.append("")
@@ -1476,30 +2200,58 @@ def render_markdown(
         "column renders '—'."
     )
     L.append("")
-    L.append("## Results (per variant)")
+    L.append(
+        "**Robust clear:** a rewrite counts as cleared when its after-score sits at "
+        f"least `--target-margin` ({config.get('target_margin', 0.0)}) below the "
+        "threshold. `robust %` is the share cleared by that margin; at the default "
+        "0.0 it equals `clear %`, so a hair-thin crossing is still counted as clear."
+    )
     L.append("")
     L.append(
-        "| Variant | n | clear % | Δscore μ | margin μ | lex div | sem div | len ratio | nums keep | tok out | att | s/doc | clears/MTok |"
+        "**AI-likeness ↓:** the configured human-likeness backend "
+        f"({config.get('human_backend', 'stylometry')}"
+        + (
+            f", using {config.get('human_backend_used')}"
+            if config.get("human_backend_used")
+            else ""
+        )
+        + (f" - {config.get('human_backend_reason')}" if config.get("human_backend_reason") else "")
+        + "); lower = more human. "
+        "**AUROC ↓:** post-removal AUROC (rewritten-watermarked vs rewritten-plain "
+        "scores); closer to 0.5 = the rewritten population is less separable "
+        "(more removal). **noop:** rewrites that returned ≈ their input (see "
+        "backtranslate caveat below) and were excluded from the clear rate."
+    )
+    L.append("")
+    L.append("## Results (per variant)")
+    L.append("")
+    post = (auroc or {}).get("post") or {}
+    L.append(
+        "| Variant | n | clear % | robust % | Δscore μ | margin μ | lex div | sem div | AI-likeness ↓ | AUROC ↓ | len ratio | nums keep | tok out | att | s/doc | clears/MTok | noop |"
     )
     L.append(
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
     )
     for variant, a in agg.items():
         L.append(
-            "| {v} | {n} | {cr} | {d} | {m} | {ld} | {sd} | {lr} | {np} | {to} | {att} | {s} | {eff} |".format(
+            "| {v} | {n} | {cr} | {rc} | {d} | {m} | {ld} | {sd} | {hu} | {au} | {lr} | {np} | {to} | {att} | {s} | {eff} | {nk} |".format(
                 v=variant,
                 n=a["n"],
                 cr=_fmt(a["clear_rate"]),
+                rc=_fmt(a.get("robust_clear_rate")),
                 d=_fmt(a["mean_score_delta"]),
                 m=_fmt(a.get("mean_margin")),
                 ld=_fmt(a["mean_lexical_divergence"]),
                 sd=_fmt(a.get("mean_semantic_divergence")),
+                hu=_fmt(a.get("mean_ai_style_score")),
+                au=_fmt(post.get(variant)),
                 lr=_fmt(a["mean_length_ratio"]),
                 np=_fmt(a["mean_numbers_preserved"]),
                 to=_fmt(a["mean_tokens_out"]),
                 att=_fmt(a.get("mean_attempts")),
                 s=_fmt(a["mean_seconds"]),
                 eff=_fmt(a["clears_per_mtok_out"]),
+                nk=a.get("noop_n", 0),
             )
         )
     L.append("")
@@ -1510,6 +2262,13 @@ def render_markdown(
         f"- Sanity-gate exclusions: {len(excluded)}/{len(samples)} "
         f"({'none' if not excluded else '; '.join(s.get('excluded_reason', '') for s in excluded[:5])})"
     )
+    base_auroc = (auroc or {}).get("baseline_auroc")
+    if base_auroc is not None:
+        L.append(
+            f"- Baseline detector AUROC (orig wm vs plain): {_fmt(base_auroc)} "
+            "(≈1.0 = the same-config detector separates; a crash here means the "
+            "same-config rig is not working)"
+        )
     if "layer-a" in agg:
         L.append(
             f"- Layer A only clear rate: {_fmt(agg['layer-a']['clear_rate'])} "
@@ -1540,6 +2299,7 @@ def render_markdown_minimal(
     rows: list[dict[str, Any]],
     agg: dict[str, Any],
 ) -> str:
+    """Render minimal-mode search results as markdown report."""
     L: list[str] = []
     L.append(f"# SynthID-text minimal-rewrite-level benchmark — {config['tag']}")
     L.append("")
@@ -1632,6 +2392,190 @@ def render_markdown_minimal(
     return "\n".join(L) + "\n"
 
 
+def _steps_str(steps: list[tuple[str, float]]) -> str:
+    """Format recipe steps into human-readable string."""
+    return " → ".join(f"{s}@{level:g}" for s, level in steps)
+
+
+def render_markdown_recipe(
+    config: dict[str, Any], samples: list[dict[str, Any]], res: dict[str, Any]
+) -> str:
+    """Render recipe search results as markdown report."""
+    L: list[str] = []
+    L.append(f"# SynthID-text recipe search — {config['tag']}")
+    L.append("")
+    L.append(f"- Date: {config['timestamp']}")
+    L.append(f"- watermarks-remover commit: {config.get('repo_commit') or 'unknown'}")
+    L.append(f"- MarkLLM commit: {config.get('markllm_commit') or 'unknown'}")
+    L.append(f"- Generator/detector model: {config['markllm_model']}")
+    L.append(f"- Corpus: {config['corpus']} ({config['docs']} docs x {config['seeds']} seeds)")
+    L.append(f"- Rewrite backend: {config['rewrite_backend']} ({config['rewrite_model']})")
+    L.append(
+        f"- Human-likeness backend: {config.get('human_backend', 'stylometry')}"
+        + (
+            f" (using {config.get('human_backend_used')})"
+            if config.get("human_backend_used")
+            else ""
+        )
+        + (f" - {config.get('human_backend_reason')}" if config.get("human_backend_reason") else "")
+    )
+    L.append(f"- Semantic model: {config.get('semantic_model') or 'not configured'}")
+    L.append("")
+    L.append("## Methodology")
+    L.append("")
+    L.append(
+        "Same-config MarkLLM SynthID samples. A recipe is an ordered list of "
+        "`strength@intensity` steps, each a Layer B rewrite with a numeric intensity "
+        "modulating that strength's prompt, applied sequentially (output feeds the "
+        "next step). "
+        + (
+            "This run searched the recipe space: Phase 1 sweeps each strength's "
+            "intensity grid; Phase 2 runs a per-weight-vector beam search that "
+            "combines an order of strengths with that weight's top intensities "
+            "(`--phase2-levels-per-strength`), so both step order and intensity are "
+            "explored. The recommended recipe is the point on the weight-independent "
+            "Pareto frontier that best matches the configured recommend weight "
+            f"(`--recommend-weight`, default {config.get('recommend_weight', '0.5/0.3/0.2')}); "
+            "the frontier below is unaffected by weights."
+            if not config.get("recipes")
+            else "This run composed and scored the explicitly requested recipe."
+        )
+    )
+    L.append("")
+    L.append(
+        "Axes: **robust clear %** (removal, ↑; requires `--target-margin` below the "
+        "threshold), **semantic divergence** (meaning drift, ↓), **human_like** "
+        "(`1 - AI-likeness`, ↑ under the configured human-likeness backend)."
+    )
+    L.append("")
+    rec = res.get("recommended")
+    L.append("## Recommended recipe")
+    L.append("")
+    if not rec:
+        L.append(
+            "No single recipe had all three axes available (add `--require-semantic` / a detector)."
+        )
+    else:
+        L.append(f"- **{_steps_str(rec['steps'])}**")
+        L.append(f"- robust clear %: {_fmt(rec.get('robust_clear_rate'))} (n={rec.get('n', 0)})")
+        L.append(f"- semantic divergence: {_fmt(rec.get('sem_div'))}")
+        L.append(f"- human_like: {_fmt(rec.get('human_like'))}")
+    L.append("")
+    L.append("## Verdict")
+    L.append("")
+    L.append(_render_recipe_verdict(res))
+    L.append("")
+    L.append("## Pareto frontier (weight-independent)")
+    L.append("")
+    front = res.get("frontier") or []
+    if not front:
+        L.append("No recipe had all three axes available; the frontier is empty.")
+    else:
+        L.append("| recipe | robust % | sem div | human_like ↑ |")
+        L.append("| --- | ---: | ---: | ---: |")
+        for c in front:
+            L.append(
+                f"| {_steps_str(c['steps'])} | {_fmt(c.get('robust_clear_rate'))} | "
+                f"{_fmt(c.get('sem_div'))} | {_fmt(c.get('human_like'))} |"
+            )
+    L.append("")
+    L.append("## Per-strength intensity curves (single-pass)")
+    L.append("")
+    curves = res.get("intensity_curves") or {}
+    if not curves:
+        L.append("Not produced (compose-run mode, or search did not sweep).")
+    else:
+        for strength, rows in curves.items():
+            L.append(f"### {strength}")
+            L.append("")
+            L.append("| level | robust % | sem div | human_like ↑ |")
+            L.append("| ---: | ---: | ---: | ---: |")
+            for r in rows:
+                L.append(
+                    f"| {r['level']:g} | {_fmt(r.get('robust_clear_rate'))} | "
+                    f"{_fmt(r.get('sem_div'))} | {_fmt(r.get('human_like'))} |"
+                )
+            L.append("")
+    L.append("## Caveats")
+    L.append("")
+    L.append(
+        "Same-config MarkLLM detection only; not Google's production SynthID-Text "
+        "keying (retired from the API Aug 2026). Human-likeness and semantic "
+        "divergence are gauges, not proof of human authorship. Recipes are "
+        "search results on this corpus/backend; re-confirm on a larger powered run."
+    )
+    L.append("")
+    L.append("## Reproduction")
+    L.append("")
+    L.append("    " + config["command"])
+    L.append("")
+    return "\n".join(L) + "\n"
+
+
+def _render_recipe_verdict(res: dict[str, Any]) -> str:
+    """Render the honest 'can the mark be removed?' verdict for the report."""
+    cands = res.get("candidates") or []
+    verdict = res.get("verdict") or _recipe_verdict(cands)
+    rates = [c.get("robust_clear_rate") for c in cands if c.get("robust_clear_rate") is not None]
+    best = _fmt(max(rates)) if rates else "n/a"
+    if verdict == "removable":
+        return (
+            "The searched space contains a recipe that robustly clears the mark "
+            f"(best robust % = {best}); treat the recommended recipe as the answer "
+            "to whether the mark is removable."
+        )
+    if verdict == "partial":
+        return (
+            f"Recipes in the searched space partially clear the mark (best robust % = {best}), "
+            "but none robustly clears every sample at the configured `--target-margin`."
+        )
+    if verdict == "resists":
+        return (
+            f"No recipe in the searched space cleared the mark (best robust % = {best}). "
+            "At this token length the mark resists the searched attacks; a lower "
+            "`--target-margin` or a higher-aggression recipe set (more steps / higher "
+            "intensities via `--phase2-levels-per-strength`) is the next lever."
+        )
+    return (
+        "Verdict undetermined: no candidate recipe had all three axes evaluated "
+        "(add `--require-semantic` / a detector)."
+    )
+
+
+def _recipe_csv(res: dict[str, Any]) -> list[str]:
+    """Export recipe search results to CSV format."""
+    import io
+
+    front = {id(c) for c in (res.get("frontier") or [])}
+    rec = res.get("recommended")
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(
+        [
+            "recipe",
+            "robust_clear_rate",
+            "semantic_divergence",
+            "human_like",
+            "n",
+            "recommended",
+            "in_frontier",
+        ]
+    )
+    for c in res.get("candidates") or []:
+        w.writerow(
+            [
+                _steps_str(c.get("steps") or []),
+                c.get("robust_clear_rate"),
+                c.get("sem_div"),
+                c.get("human_like"),
+                c.get("n"),
+                1 if rec is not None and id(rec) == id(c) else 0,
+                1 if id(c) in front else 0,
+            ]
+        )
+    return out.getvalue().rstrip("\n").splitlines()
+
+
 def _csv_cell(value: Any) -> Any:
     """Render a CSV cell: None -> empty field, True/False -> 1/0, else as-is.
 
@@ -1648,6 +2592,7 @@ def _csv_cell(value: Any) -> Any:
 
 
 def _minimal_csv(rows: list[dict[str, Any]]) -> list[str]:
+    """minimal csv."""
     import io
 
     out = io.StringIO()
@@ -1695,6 +2640,7 @@ def _minimal_csv(rows: list[dict[str, Any]]) -> list[str]:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build CLI argument parser for text rewrite tool."""
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--markllm-dir", default=os.environ.get("MARKLLM_DIR"))
     p.add_argument(
@@ -1726,12 +2672,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--mode",
-        choices=("variants", "minimal"),
+        choices=("variants", "minimal", "recipe"),
         default="variants",
         help="variants: run named-strength rewrite variants (default). minimal: "
         "per sample, raise the numeric rewrite level (--rewrite-level-start, "
         "+--rewrite-level-step) until a rewrite is no longer watermarked, then "
-        "report the average minimal level.",
+        "report the average minimal level. recipe: search (or compose-run, with "
+        "--recipes) for the best strength@intensity combination and report the "
+        "Pareto frontier.",
     )
     p.add_argument(
         "--restamp-control", action="store_true", help="Also rewrite the unwatermarked control"
@@ -1835,6 +2783,84 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not use the persistent MarkLLM serve worker (one-shot subprocesses)",
     )
+    p.add_argument(
+        "--noop-lex-floor",
+        type=float,
+        default=0.05,
+        help="Treat a rewrite that changed fewer than this fraction of bigrams as "
+        "a no-op (cleared=None, so it never counts as a clear; reported as noop; "
+        "default 0.05, 0 disables). Forwarded to rewrite_text.py. Mirrors the "
+        "backtranslate no-op fix that keeps a near-verbatim output from being "
+        "read as '0%% clear'.",
+    )
+    p.add_argument(
+        "--human-backend",
+        choices=("stylometry", "lastde", "binoculars", "pangram"),
+        default="stylometry",
+        help="Human-likeness axis. 'stylometry' (default) is the always-on "
+        "stdlib-only score; 'lastde'/'binoculars' run an optional offline "
+        "AI-text detector (probed at startup, degrade to stylometry if absent); "
+        "'pangram' uses the Pangram Labs async **bulk** API (key in "
+        "PANGRAM_API_KEY, model via --human-pangram-model). Score is AI-likeness "
+        "(lower = more human); human_like = 1 - score.",
+    )
+    p.add_argument(
+        "--human-detector-dir",
+        default=os.environ.get("HUMAN_DETECTOR_DIR"),
+        help="Checkout root for the Lastde/Binoculars detector (default: "
+        "$HUMAN_DETECTOR_DIR). Required when --human-backend is a detector.",
+    )
+    p.add_argument(
+        "--human-pangram-model",
+        default=os.environ.get("PANGRAM_MODEL", "pangram-4"),
+        help="Pangram model id (default: pangram-4; falls back to an allowed "
+        "model discovered via GET /models). Key is read from PANGRAM_API_KEY.",
+    )
+    p.add_argument(
+        "--intensity-grid",
+        default="0.2,0.4,0.6,0.8,1.0",
+        help="Comma list of intensities swept per strength in recipe mode "
+        "(default: 0.2,0.4,0.6,0.8,1.0)",
+    )
+    p.add_argument(
+        "--weight-grid",
+        default="0.8/0.1/0.1,0.5/0.3/0.2,0.2/0.6/0.2,0.2/0.2/0.6,0.34/0.33/0.33",
+        help="Comma list of w_removal/w_semantic/w_human weight vectors driving the "
+        "composition search (default: the 5-vector grid). The Pareto frontier is "
+        "weight-independent.",
+    )
+    p.add_argument("--beam", type=int, default=4, help="Composition-search beam width (default: 4)")
+    p.add_argument(
+        "--max-passes", type=int, default=3, help="Max recipe steps in the search (default: 3)"
+    )
+    p.add_argument(
+        "--phase2-levels-per-strength",
+        type=int,
+        default=3,
+        help="Per-weight top-k intensities considered in the phase 2 beam search "
+        "(default: 3). Raising this broadens the search over intensities and "
+        "aggressive multi-step recipes but costs more evals; lower it to stay "
+        "inside a tight wall-clock budget.",
+    )
+    p.add_argument(
+        "--recommend-weight",
+        default="0.5/0.3/0.2",
+        help="w_removal/w_semantic/w_human used to pick the recommended recipe "
+        "from the weight-independent Pareto frontier (default: 0.5/0.3/0.2).",
+    )
+    p.add_argument(
+        "--recipes",
+        default=None,
+        help="Explicit recipe to compose-run and score (not a search), e.g. "
+        "'chunk@0.6,paraphrase@0.3,humanize@1.0'. Used with --mode recipe.",
+    )
+    p.add_argument(
+        "--layer-a-after",
+        action="store_true",
+        default=False,
+        help="Re-run the Unicode scrub (/clean) on the composed recipe's final "
+        "output. Default OFF: the rewrite backend is assumed watermark-safe.",
+    )
     return p
 
 
@@ -1861,6 +2887,7 @@ def _semantic_startup_probe(bench: Benchmark, semantic_model: str, require: bool
 
 
 def main() -> int:
+    """CLI entry point."""
     args = build_parser().parse_args()
 
     if not args.markllm_dir:
@@ -1879,6 +2906,27 @@ def main() -> int:
             "(content will leave this machine)"
         )
         return 2
+
+    # Fail fast on a bad recipe grid/spec and positive-value flags before
+    # constructing Benchmark, which starts MarkLLMWorker and the semantic
+    # backend. A misconfigured --intensity-grid / --weight-grid / --beam /
+    # --max-passes would otherwise only be rejected after the expensive setup
+    # (and before the worker-cleanup path that normally runs on early returns).
+    if args.mode == "recipe":
+        parse_float_grid(args.intensity_grid)
+        parse_weight_grid(args.weight_grid)
+        parse_weight_vec(args.recommend_weight)
+        if args.phase2_levels_per_strength < 1:
+            eprint("error: --phase2-levels-per-strength must be >= 1")
+            return 1
+        if args.beam < 1:
+            eprint("error: --beam must be >= 1")
+            return 1
+        if args.max_passes < 1:
+            eprint("error: --max-passes must be >= 1")
+            return 1
+        if args.recipes:
+            parse_recipe(args.recipes)
 
     bench = Benchmark(args, upstream)
     if not bench.corpus:
@@ -1925,6 +2973,19 @@ def main() -> int:
         "semantic_model": args.semantic_model,
         "semantic_available": bool(bench.semantic.available()),
         "semantic_reason": bench.semantic.reason(),
+        "noop_lex_floor": args.noop_lex_floor,
+        "human_backend": args.human_backend,
+        "human_detector_dir": args.human_detector_dir,
+        "human_pangram_model": bench.human.pangram_model,
+        "human_backend_used": bench.human.backend_used,
+        "intensity_grid": args.intensity_grid,
+        "weight_grid": args.weight_grid,
+        "beam": args.beam,
+        "max_passes": args.max_passes,
+        "phase2_levels_per_strength": args.phase2_levels_per_strength,
+        "recommend_weight": args.recommend_weight,
+        "recipes": args.recipes,
+        "layer_a_after": args.layer_a_after,
         "command": " ".join(
             [
                 "python3 service/scripts/bench_synthid_text.py",
@@ -1947,6 +3008,26 @@ def main() -> int:
                 f"--level-attempts {args.level_attempts}",
                 *([f"--target-margin {args.target_margin}"] if args.target_margin else []),
                 f"--semantic-model {args.semantic_model}",
+                f"--noop-lex-floor {args.noop_lex_floor}",
+                f"--human-backend {args.human_backend}",
+                *(
+                    [f"--human-detector-dir {args.human_detector_dir}"]
+                    if args.human_detector_dir
+                    else []
+                ),
+                *(
+                    [f"--human-pangram-model {args.human_pangram_model}"]
+                    if args.human_backend == "pangram"
+                    else []
+                ),
+                f"--intensity-grid {args.intensity_grid}",
+                f"--weight-grid {args.weight_grid}",
+                f"--beam {args.beam}",
+                f"--max-passes {args.max_passes}",
+                f"--phase2-levels-per-strength {args.phase2_levels_per_strength}",
+                f"--recommend-weight {args.recommend_weight}",
+                *([f"--recipes {args.recipes}"] if args.recipes else []),
+                *(["--layer-a-after"] if args.layer_a_after else []),
                 *(["--restamp-control"] if args.restamp_control else []),
                 *(["--rewrite-allow-remote"] if args.rewrite_allow_remote else []),
                 f"--out-dir {args.out_dir}",
@@ -1965,15 +3046,41 @@ def main() -> int:
         samples = bench.generate_samples(workdir)
         if args.mode == "minimal":
             rows = bench.minimal_search(samples, workdir)
+        elif args.mode == "recipe":
+            rows = []
+            if args.recipes:
+                recipe = parse_recipe(args.recipes)
+                candid = bench._eval_recipe(recipe, samples)
+                if candid.get("n", 0) == 0:
+                    eprint("error: recipe produced no evaluable samples (watermark not detected?)")
+                    return 2
+                candid["steps"] = recipe
+                res = {
+                    "candidates": [candid],
+                    "recommended": candid,
+                    "frontier": [candid],
+                    "intensity_curves": {},
+                }
+            else:
+                res = bench.recipe_search(samples, workdir)
         else:
             rows = bench.run_variants(samples, workdir)
     finally:
         bench.close_worker()
 
+    # Scoring is done; reflect any backend fallback (e.g. Pangram -> stylometry)
+    # that happened while measuring, so the report labels the scores correctly.
+    config["human_backend_used"] = bench.human.backend_used
+    config["human_backend_reason"] = bench.human.reason()
+
     if args.mode == "minimal":
         agg = aggregate_minimal(rows)
         report = render_markdown_minimal(config, samples, rows, agg)
         csv_lines = _minimal_csv(rows)
+    elif args.mode == "recipe":
+        report = render_markdown_recipe(config, samples, res)
+        agg = {}
+        csv_lines = _recipe_csv(res)
     else:
         # Attach USD cost using per-doc token estimates.
         for row in rows:
@@ -1986,7 +3093,8 @@ def main() -> int:
 
         agg = aggregate(rows, bench.variants)
 
-        report = render_markdown(config, samples, rows, agg)
+        auroc = compute_auroc(samples, rows, bench.variants)
+        report = render_markdown(config, samples, rows, agg, auroc)
         import io
 
         _csv_buf = io.StringIO()
@@ -2003,6 +3111,10 @@ def main() -> int:
                 "before_pos",
                 "after_pos",
                 "cleared",
+                "robust_cleared",
+                "noop",
+                "ai_style_score",
+                "human_backend",
                 "score_before",
                 "score_after",
                 "margin",
@@ -2038,6 +3150,10 @@ def main() -> int:
                     1 if r.get("before_pos") else 0,
                     1 if r.get("after_pos") else 0,
                     _csv_cell(r.get("cleared")),
+                    _csv_cell(r.get("robust_cleared")),
+                    1 if r.get("noop") else 0,
+                    _csv_cell(r.get("ai_style_score")),
+                    r.get("human_backend", ""),
                     _csv_cell(r.get("score_before")),
                     _csv_cell(r.get("score_after")),
                     _csv_cell(r.get("margin")),
@@ -2057,10 +3173,10 @@ def main() -> int:
         csv_lines = _csv_buf.getvalue().rstrip("\n").splitlines()
 
     (out_dir / "report.md").write_text(report, encoding="utf-8")
-    (out_dir / "results.json").write_text(
-        json.dumps({"meta": config, "samples": samples, "rows": rows, "aggregates": agg}, indent=2),
-        encoding="utf-8",
-    )
+    payload: dict[str, Any] = {"meta": config, "samples": samples, "rows": rows, "aggregates": agg}
+    if args.mode == "recipe":
+        payload["recipe"] = res
+    (out_dir / "results.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
     (out_dir / "results.csv").write_text("\n".join(csv_lines) + "\n", encoding="utf-8")
 
     eprint("")
@@ -2078,6 +3194,22 @@ def main() -> int:
         print(f"  mean min sem div  : {_fmt(agg['mean_min_semantic_divergence'])}")
         print(f"  mean min lex div  : {_fmt(agg['mean_min_lexical_divergence'])}")
         print(f"  mean min margin   : {_fmt(agg['mean_min_margin'])}")
+    elif args.mode == "recipe":
+        rec = res.get("recommended")
+        print("best recipe (recommended)")
+        print("-" * 40)
+        if not rec:
+            print("  none (no recipe had all three axes available)")
+        else:
+            print(
+                f"  steps         : {' → '.join(f'{s}@{level_i:g}' for s, level_i in rec['steps'])}"
+            )
+            print(f"  robust clear %: {_fmt(rec.get('robust_clear_rate'))}")
+            print(f"  semantic div  : {_fmt(rec.get('sem_div'))}")
+            print(f"  human_like    : {_fmt(rec.get('human_like'))}")
+        print(
+            f"  frontier size : {len(res.get('frontier') or [])} / candidates {len(res.get('candidates') or [])}"
+        )
     else:
         print(
             "variant          n   clear%  dScore  margin  lexDiv  semDiv  lenR  nums  tokOut  att  s/doc  eff/MTok"

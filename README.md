@@ -1115,13 +1115,9 @@ Third-party projects that wrap or complement this repository, listed for discove
 
 [unmark-web](https://github.com/ivanusto/unmark-web) is an independent, MIT-licensed static web client. It removes invisible Unicode marks from text and strips provenance metadata from images entirely in the browser, and can optionally call this repository's HTTP service for the formats it does not handle locally. It is a separate codebase and is not affiliated with this project; see its README for scope and limits.
 
-### ClaudeWatermarks — browser-local text inspector
-
-[ClaudeWatermarks](https://claudewatermarks.com) is an independent, free web tool that inspects pasted text for invisible Unicode carriers entirely in the browser — nothing is uploaded — and lists every finding with its code point, position and surrounding context so the reader decides what to remove. Its inspector engine is published separately as [claude-text-inspector](https://github.com/little-pp395/claude-text-inspector) (MIT, TypeScript); its code-point tables and in-context preservation rules (emoji glue, script joiners, flag tags) follow this repository's Layer A engine. The site also reads C2PA Content Credentials from supported files locally. It does not call this repository's service, and it states plainly that it cannot detect or remove Claude's statistical text mark. It is a separate codebase and is not affiliated with this project; see its README for scope and limits.
-
 ### Adding a project
 
-To register a project here, open a PR adding a short entry — project name, what it wraps or adds, and a link to its own repository. Keep entries brief and factual; do not claim compatibility with, or endorsement by, this project. Please avoid names that start with or closely resemble `watermarks-remover` — look-alike names make it hard to tell which project is which.
+To register a project here, open a PR adding a short entry — project name, what it wraps or adds, and a link to its own repository. Keep entries brief and factual; do not claim compatibility with, or endorsement by, this project. A listed project should build on or integrate this repository — for example, by calling its service or reusing its detection engine — rather than merely address the same problem independently. Please avoid names that start with or closely resemble `watermarks-remover` — look-alike names make it hard to tell which project is which.
 
 ## Pre-commit hook
 
@@ -1205,6 +1201,7 @@ make smoke                          # quick CLI smoke on fixtures
 ### Unreleased
 
 - Pre-commit clean hook (`watermarks-remover-clean` / `clean_staged.py`): use content digests (`SHA-256`) and active action detection so clean files on disk are recognized without demanding infinite re-staging (#173)
+- **OOXML container preservation**: keep `<AppVersion>` intact in `docProps/app.xml` during DOCX, XLSX, and PPTX metadata cleaning to satisfy ECMA-376 schema constraints and avoid Microsoft Word/Office "unreadable content" errors (#283)
 
 ### [v0.5.0](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.5.0) — service & Docker distribution, HTTP API, and verification harnesses
 
@@ -1364,6 +1361,7 @@ MIT — see [LICENSE](LICENSE).
 - Pan et al., [*Can LLM Watermarks Robustly Prevent Unauthorized Knowledge Distillation?*](https://arxiv.org/abs/2502.11598) — watermark-based provenance and protection against knowledge distillation
 - [google-deepmind/synthid-text](https://github.com/google-deepmind/synthid-text) (research reference; not used for detection here)
 - [aloshdenny/reverse-SynthID](https://github.com/aloshdenny/reverse-SynthID) (research reference)
+- ETH Zurich SRI, [*Probing SynthID*](https://www.sri.inf.ethz.ch/blog/probingsynthid) (research blog on the detectability of SynthID watermarks)
 - Liu et al., [*Image Watermarks are Removable Using Controllable Regeneration from Clean Noise*](https://arxiv.org/abs/2410.05470) (ICLR 2025) — the pixel-regeneration method the optional CtrlRegen backend implements — [code](https://github.com/yepengliu/CtrlRegen)
 - Kassis & Hengartner, [*UnMarker: A Universal Attack on Defensive Image Watermarking*](https://arxiv.org/abs/2405.08363) (arXiv:2405.08363; IEEE S&P 2025) — a universal watermark attack compared on a different metric than CtrlRegen
 - Goonatilake & Ateniese, [*Removing the Watermark Is Not Enough: Forensic Stealth in Generative-AI Watermark Removal*](https://arxiv.org/abs/2605.09203) (arXiv:2605.09203) — motivates the conservative-strength default: removal can still leave forensic traces

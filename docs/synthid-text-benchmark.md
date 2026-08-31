@@ -271,3 +271,71 @@ unless you want the raw samples.
   Very short samples are excluded by the sanity gate automatically.
 - Compare variants (strength x candidates) within one run, not across runs
   with different backends - the rewrite model dominates the outcome.
+
+## Measurements you should read together
+
+- **clear % vs robust %.** clear % is the per-sample, single-threshold verdict;
+  robust % only counts samples whose after-score sits at least `--target-margin`
+  below the threshold. At the default `--target-margin 0.0` the two are equal, so
+  a hair-thin crossing still reads as "cleared" - that is why a default-level
+  decision should run with `--target-margin 0.03`.
+- **noop.** A rewrite that changed fewer than `--noop-lex-floor` (default 0.05)
+  of bigrams is reported as a no-op and excluded from the clear-rate denominator.
+  A `backtranslate` row showing ~0% clear with near-zero lex divergence is a
+  **backend no-op**, not evidence that backtranslation is weak - check the noop
+  column before believing a 0% clear.
+- **AUROC (post).** Area Under the ROC curve between the rewritten-watermarked
+  and rewritten-unwatermarked after-scores. 1.0 = perfectly separable, 0.5 =
+  indistinguishable. It is threshold-independent and population-level, so it
+  complements clear %: a row that clears by a hair still moves AUROC little,
+  while a row that erases the mark's distributional signal drives AUROC toward
+  0.5. Requires `--restamp-control`; degrades to `—` otherwise.
+- **human_like ↑** (`1 − AI-likeness`) under `--human-backend`: `stylometry`
+  (default, stdlib), `lastde`/`binoculars` (offline `ai_human.py` checkout), or
+  `pangram` (Pangram Labs async **bulk** API; key in `PANGRAM_API_KEY`, model via
+  `--human-pangram-model`). In the variants table the same backend score is
+  shown as raw `AI-likeness ↓`. A gauge, not a proof of human authorship; a
+  missing key/backend degrades to stylometry.
+
+## Recipe search mode (`--mode recipe`)
+
+Instead of a per-variant table, this mode answers "what is the best combination
+of strategies, and at what intensity for each?" A recipe is an ordered list of
+`strength@intensity` steps, each a Layer B rewrite with a numeric intensity that
+modulates that strength's prompt (e.g. `chunk@0.6,paraphrase@0.3,humanize@1.0`),
+applied sequentially - each step's output feeds the next.
+
+- Phase 1 sweeps each strength over `--intensity-grid` (single-step recipes) and
+  produces the per-strength intensity curves (robust %, sem div, human_like vs
+  intensity).
+- Phase 2 runs a beam search (`--beam`, `--max-passes`) once per weight vector in
+  `--weight-grid`, combining an order of strengths with the top
+  `--phase2-levels-per-strength` intensities for that weight, so both step order
+  and intensity are explored.
+- The report's **Pareto frontier** is computed by dominance (no weights) over the
+  union of all candidates, so it is weight-independent. The "recommended" recipe
+  is the frontier point best matching `--recommend-weight` (a
+  w_removal/w_semantic/w_human triple summing to 1.0, default `0.5/0.3/0.2`).
+  The report's **Verdict** section distinguishes the no-clear cases rather than
+  calling every empty result `resists`: it reports **resists** only when the
+  best verified robust clear % is 0.0, and **undetermined** when no candidate
+  recipe was evaluable (all three axes missing, so no verified clear rate
+  exists). Either way, an empty or unevaluable search is stated explicitly
+  instead of leaving an empty frontier to interpret.
+- `--recipes "chunk@0.6,paraphrase@0.3"` composes and scores one explicit recipe
+  instead of searching.
+- `--layer-a-after` re-runs the Unicode scrub on the final output; default **off**
+  because the rewrite backend is assumed watermark-safe.
+
+    ~/MarkLLM/.venv/bin/python service/scripts/bench_synthid_text.py \
+      --markllm-dir ~/MarkLLM \
+      --corpus benchmarks/corpus-large --docs 20 --seeds 3 --max-new-tokens 300 \
+      --mode recipe --target-margin 0.03 --restamp-control --require-semantic \
+      --rewrite-backend openai-compatible --rewrite-model <model> \
+      --rewrite-base-url <url> --rewrite-allow-remote --tag <backend>
+
+A recipe search is expensive (each candidate = a full rewrite chain per sample).
+Run Phase 1 coarsely first with fewer docs/seeds, then confirm the winning
+recipes on a larger run with adequate statistical power. Lower
+`--phase2-levels-per-strength` (or cut docs/seeds, `--beam`, `--max-passes`) to
+keep a run inside a tight wall-clock budget.
