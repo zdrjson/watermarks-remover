@@ -568,6 +568,141 @@ def test_main_allow_remote_from_env(tmp_path, monkeypatch):
     assert bench.main() == 0
 
 
+def test_main_explicit_strategy_verdict_not_forced_resists(tmp_path, monkeypatch):
+    """A compose-run below the coverage floor is partial/removable, not resists."""
+    (tmp_path / "markllm" / "watermark").mkdir(parents=True)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "d1.txt").write_text("prompt", encoding="utf-8")
+
+    class _ComposeBench(_FakeBench):
+        def _eval_strategy(self, strategy, samples=None):
+            ends_humanize = bool(strategy) and strategy[-1][0] == "humanize"
+            return {
+                "robust_clear_rate": 0.4 if ends_humanize else 1.0,
+                "sem_div": 0.1,
+                "human_like": 0.9,
+                "n": 1,
+                "unverified": 0,
+            }
+
+        def _persist_strategy_outputs(self, cands, workdir):
+            return 0
+
+    monkeypatch.setattr(bench, "Benchmark", _ComposeBench)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "bench_synthid_text.py",
+            "--markllm-dir",
+            str(tmp_path / "markllm"),
+            "--corpus",
+            str(corpus),
+            "--docs",
+            "1",
+            "--rewrite-model",
+            "m",
+            "--mode",
+            "strategy",
+            "--strategies",
+            "paraphrase@0.4",
+            "--coverage-floor",
+            "0.5",
+            "--out-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+    assert bench.main() == 0
+    data = json.loads((tmp_path / "out" / "results.json").read_text(encoding="utf-8"))
+    st = data["strategy"]
+    assert st["recommended"] is None
+    assert st["verdict"] != "resists"
+    assert st["verdict"] == "removable"
+    assert any(c.get("humanize_vetoed") for c in st["candidates"])
+
+
+def test_main_explicit_strategy_honors_eval_split(tmp_path, monkeypatch):
+    """--strategies recommendation eligibility uses the holdout rate when --eval-split is set."""
+    (tmp_path / "markllm" / "watermark").mkdir(parents=True)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "a.txt").write_text("prompt a", encoding="utf-8")
+    (corpus / "z.txt").write_text("prompt z", encoding="utf-8")
+
+    class _ComposeBench(_FakeBench):
+        def generate_samples(self, workdir):
+            return [
+                {
+                    "doc": "a",
+                    "seed": 1,
+                    "excluded": False,
+                    "notes": [],
+                    "watermarked": "w",
+                    "unwatermarked": "p",
+                    "before": dict(DETECT_POS),
+                    "plain_detect": dict(DETECT_NEG),
+                },
+                {
+                    "doc": "z",
+                    "seed": 1,
+                    "excluded": False,
+                    "notes": [],
+                    "watermarked": "w",
+                    "unwatermarked": "p",
+                    "before": dict(DETECT_POS),
+                    "plain_detect": dict(DETECT_NEG),
+                },
+            ]
+
+        def _eval_strategy(self, strategy, samples=None):
+            docs = {s.get("doc") for s in (samples or [])}
+            holdout_only = bool(docs) and docs <= {"z"}
+            return {
+                "robust_clear_rate": 0.0 if holdout_only else 1.0,
+                "sem_div": 0.1,
+                "human_like": 0.9,
+                "n": 1,
+                "unverified": 0,
+            }
+
+        def _persist_strategy_outputs(self, cands, workdir):
+            return 0
+
+    monkeypatch.setattr(bench, "Benchmark", _ComposeBench)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "bench_synthid_text.py",
+            "--markllm-dir",
+            str(tmp_path / "markllm"),
+            "--corpus",
+            str(corpus),
+            "--docs",
+            "2",
+            "--rewrite-model",
+            "m",
+            "--mode",
+            "strategy",
+            "--strategies",
+            "paraphrase@0.4",
+            "--coverage-floor",
+            "0.5",
+            "--eval-split",
+            "0.5",
+            "--out-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+    assert bench.main() == 0
+    data = json.loads((tmp_path / "out" / "results.json").read_text(encoding="utf-8"))
+    st = data["strategy"]
+    assert st["recommended"] is None
+    rec_cand = next(c for c in st["candidates"] if c["steps"][-1][0] == "humanize")
+    assert rec_cand.get("holdout_robust_clear_rate") == 0.0
+
+
 def test_main_rejects_nonpositive_beam_or_max_passes(tmp_path, monkeypatch, capsys):
     """A --beam or --max-passes below 1 fails fast in strategy mode.
 
@@ -1346,6 +1481,26 @@ def test_strategy_verdict():
     assert _strategy_verdict([c(0.0)]) == "resists"
     assert _strategy_verdict([]) == "undetermined"
     assert _strategy_verdict([{"sem_div": 0.2, "human_like": 0.7}]) == "undetermined"
+    # Style-only polish must not produce a removable verdict.
+    assert (
+        _strategy_verdict(
+            [
+                {
+                    "steps": [("humanize", 1.0)],
+                    "robust_clear_rate": 1.0,
+                    "sem_div": 0.1,
+                    "human_like": 0.9,
+                },
+                {
+                    "steps": [("paraphrase", 0.4)],
+                    "robust_clear_rate": 0.0,
+                    "sem_div": 0.1,
+                    "human_like": 0.9,
+                },
+            ]
+        )
+        == "resists"
+    )
 
 
 def test_render_strategy_verdict_resists():
@@ -1356,6 +1511,19 @@ def test_render_strategy_verdict_resists():
     text = bench._render_strategy_verdict(res)
     assert "resists" in text.lower()
     assert "at this token length" in text.lower()
+
+
+def test_render_strategy_verdict_removable_without_recommendation():
+    """A removable verdict with no shippable default must not point at a recommendation."""
+    res = {
+        "candidates": [{"robust_clear_rate": 1.0, "sem_div": 0.1, "human_like": 0.9}],
+        "verdict": "removable",
+        "recommended": None,
+    }
+    text = bench._render_strategy_verdict(res)
+    assert "robustly clears" in text.lower()
+    assert "nothing is recommended" in text.lower()
+    assert "treat the recommended strategy as the answer" not in text.lower()
 
 
 def test_parse_float_grid():
@@ -1724,6 +1892,216 @@ def test_recommended_humanized_is_search_candidate(tmp_path, monkeypatch):
     assert rec is not None
     assert rec["steps"][-1][0] == "humanize"
     assert any(rec is c for c in res["candidates"])
+
+
+def test_strategy_search_no_recommend_when_humanize_always_vetoes(tmp_path, monkeypatch):
+    """Removal-only clears are not recommended: production has no detector, so a
+    strategy that fails after the final humanize is not a shippable default."""
+    args = _args(
+        out_dir=tmp_path,
+        mode="strategy",
+        intensity_grid="0.4,1.0",
+        phase2_levels_per_tactic=1,
+        beam=1,
+        max_passes=1,
+        recommend_weight="0.5/0.3/0.2",
+        coverage_floor=0.5,
+        humanize_intensity=0.4,
+    )
+    b = bench.Benchmark(args, Path(args.markllm_dir))
+
+    def evaluate(strategy, samples=None):
+        ends_humanize = bool(strategy) and strategy[-1][0] == "humanize"
+        return {
+            "robust_clear_rate": 0.0 if ends_humanize else 1.0,
+            "sem_div": 0.1,
+            "human_like": 0.9,
+            "n": 1,
+            "unverified": 0,
+        }
+
+    monkeypatch.setattr(b, "_eval_strategy", evaluate)
+    samples = [{"excluded": False, "watermarked": "w", "before": DETECT_POS}]
+    res = b.strategy_search(samples, tmp_path / "work")
+    assert res["recommended"] is None
+    # The mark is removable; there is just no shippable (humanize-last) default.
+    assert res["verdict"] == "removable"
+    vetoed = [c for c in res["candidates"] if c.get("humanize_vetoed")]
+    assert vetoed and all(c["steps"][-1][0] == "humanize" for c in vetoed)
+
+
+def test_strategy_search_falls_through_frontier_when_humanize_vetoes(tmp_path, monkeypatch):
+    """If appending humanize to the top pick re-introduces the mark, recommend the
+    next frontier candidate that still clears after the final humanize."""
+    args = _args(
+        out_dir=tmp_path,
+        mode="strategy",
+        intensity_grid="0.4,1.0",
+        phase2_levels_per_tactic=1,
+        beam=1,
+        max_passes=1,
+        recommend_weight="0.5/0.3/0.2",
+        coverage_floor=0.5,
+        humanize_intensity=0.4,
+    )
+    b = bench.Benchmark(args, Path(args.markllm_dir))
+
+    def evaluate(strategy, samples=None):
+        steps = list(strategy or [])
+        ends_humanize = bool(steps) and steps[-1][0] == "humanize"
+        removal = [t for t, _lv in steps if t != "humanize"]
+        # paraphrase (+ humanize) re-introduces the mark; any other removal
+        # tactic still clears after the polish.
+        paraphrase_polish = ends_humanize and (not removal or removal[0] == "paraphrase")
+        rate = 0.0 if paraphrase_polish else 1.0
+        return {
+            "robust_clear_rate": rate,
+            "sem_div": 0.1,
+            "human_like": 0.9,
+            "n": 1,
+            "unverified": 0,
+        }
+
+    monkeypatch.setattr(b, "_eval_strategy", evaluate)
+    samples = [{"excluded": False, "watermarked": "w", "before": DETECT_POS}]
+    res = b.strategy_search(samples, tmp_path / "work")
+    rec = res["recommended"]
+    assert rec is not None
+    assert rec["steps"][-1][0] == "humanize"
+    assert rec["steps"][0][0] != "paraphrase"
+    assert rec.get("humanize_note")
+    assert rec.get("robust_clear_rate") == 1.0
+    assert res["verdict"] == "removable"
+    assert any(c.get("humanize_vetoed") for c in res["candidates"])
+
+
+def test_strategy_search_skips_humanize_only_recommendation(tmp_path, monkeypatch):
+    """A humanize-only candidate that clears is polish, not a shippable remover."""
+    args = _args(
+        out_dir=tmp_path,
+        mode="strategy",
+        intensity_grid="0.4,1.0",
+        phase2_levels_per_tactic=1,
+        beam=1,
+        max_passes=1,
+        recommend_weight="0.5/0.3/0.2",
+        coverage_floor=0.5,
+        humanize_intensity=0.4,
+    )
+    b = bench.Benchmark(args, Path(args.markllm_dir))
+
+    def evaluate(strategy, samples=None):
+        steps = list(strategy or [])
+        only_humanize = bool(steps) and all(t == "humanize" for t, _lv in steps)
+        return {
+            "robust_clear_rate": 1.0 if only_humanize else 0.0,
+            "sem_div": 0.01,
+            "human_like": 0.99,
+            "n": 1,
+            "unverified": 0,
+        }
+
+    monkeypatch.setattr(b, "_eval_strategy", evaluate)
+    samples = [{"excluded": False, "watermarked": "w", "before": DETECT_POS}]
+    res = b.strategy_search(samples, tmp_path / "work")
+    rec = res["recommended"]
+    assert rec is None or bench._has_removal_step(rec["steps"])
+    assert rec is None
+    assert res["verdict"] == "resists"
+
+
+def test_strategy_search_polished_pipeline_uses_holdout_floor(tmp_path, monkeypatch):
+    """Appending humanize is judged on holdout when --eval-split is set."""
+    args = _args(
+        out_dir=tmp_path,
+        mode="strategy",
+        intensity_grid="0.4,1.0",
+        phase2_levels_per_tactic=1,
+        beam=1,
+        max_passes=1,
+        recommend_weight="0.5/0.3/0.2",
+        coverage_floor=0.5,
+        humanize_intensity=0.4,
+        eval_split=0.5,
+    )
+    b = bench.Benchmark(args, Path(args.markllm_dir))
+    holdout_docs = {"z"}
+
+    def evaluate(strategy, samples=None):
+        docs = {s.get("doc") for s in (samples or [])}
+        ends_humanize = bool(strategy) and strategy[-1][0] == "humanize"
+        holdout_only = bool(docs) and docs <= holdout_docs
+        rate = 0.0 if (holdout_only and ends_humanize) else 1.0
+        return {
+            "robust_clear_rate": rate,
+            "sem_div": 0.1,
+            "human_like": 0.9,
+            "n": 1,
+            "unverified": 0,
+        }
+
+    monkeypatch.setattr(b, "_eval_strategy", evaluate)
+    samples = [
+        {"doc": "a", "seed": 1, "excluded": False, "watermarked": "w", "before": DETECT_POS},
+        {"doc": "z", "seed": 1, "excluded": False, "watermarked": "w", "before": DETECT_POS},
+    ]
+    res = b.strategy_search(samples, tmp_path / "work")
+    assert res["recommended"] is None
+    vetoed = [c for c in res["candidates"] if c.get("humanize_vetoed")]
+    assert vetoed
+    assert all(c.get("holdout_robust_clear_rate") == 0.0 for c in vetoed)
+
+
+def test_strategy_search_unverified_holdout_is_ineligible(tmp_path, monkeypatch):
+    """A missing holdout rate must not fall back to the all-sample clear rate."""
+    args = _args(
+        out_dir=tmp_path,
+        mode="strategy",
+        intensity_grid="0.4,1.0",
+        phase2_levels_per_tactic=1,
+        beam=1,
+        max_passes=1,
+        recommend_weight="0.5/0.3/0.2",
+        coverage_floor=0.5,
+        humanize_intensity=0.4,
+        eval_split=0.5,
+    )
+    b = bench.Benchmark(args, Path(args.markllm_dir))
+    holdout_docs = {"z"}
+
+    def evaluate(strategy, samples=None):
+        docs = {s.get("doc") for s in (samples or [])}
+        holdout_only = bool(docs) and docs <= holdout_docs
+        if holdout_only:
+            return {
+                "robust_clear_rate": None,
+                "sem_div": None,
+                "human_like": None,
+                "n": 0,
+                "unverified": 1,
+            }
+        return {
+            "robust_clear_rate": 1.0,
+            "sem_div": 0.1,
+            "human_like": 0.9,
+            "n": 1,
+            "unverified": 0,
+        }
+
+    monkeypatch.setattr(b, "_eval_strategy", evaluate)
+    samples = [
+        {"doc": "a", "seed": 1, "excluded": False, "watermarked": "w", "before": DETECT_POS},
+        {"doc": "z", "seed": 1, "excluded": False, "watermarked": "w", "before": DETECT_POS},
+    ]
+    res = b.strategy_search(samples, tmp_path / "work")
+    assert res["recommended"] is None
+    assert (
+        bench._coverage_of(
+            {"robust_clear_rate": 1.0, "holdout_robust_clear_rate": None},
+            prefer_holdout=True,
+        )
+        is None
+    )
 
 
 def test_adaptive_excludes_unverified(tmp_path, monkeypatch):
@@ -2101,6 +2479,8 @@ def test_render_markdown_strategy_and_csv():
     assert "Recommend" in md
     assert "chunk@0.6" in md
     assert "Pareto frontier" in md
+    assert "vetoed" in md.lower()
+    assert "next ranked" in md.lower()
     csv = bench._strategy_csv(res)
     assert any("chunk@0.6" in line for line in csv)
     assert csv[0].startswith("strategy,")  # header

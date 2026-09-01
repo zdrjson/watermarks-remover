@@ -143,6 +143,81 @@ def test_html_cms_generator_attribute_names_are_case_insensitive():
     assert clean_html(ai_html)[0] == ""
 
 
+def test_html_jsonld_ai_block_detected_and_cleaned():
+    ai = (
+        '<script type="application/ld+json">'
+        '{"@type":"CreativeWork","digitalSourceType":"trainedAlgorithmicMedia"}'
+        "</script>"
+    )
+    _has_c2pa, has_ai, findings, _ = inspect_html(ai)
+    assert has_ai is True
+    assert any("json-ld provenance-like block" in f for f in findings)
+    cleaned, _actions = clean_html(ai)
+    assert "digitalSourceType" not in cleaned
+
+
+def test_html_jsonld_clean_keeps_plain_jsonld_and_regular_scripts():
+    # Only json-ld blocks that actually carry AI provenance are dropped. A plain
+    # json-ld block and an ordinary <script> that merely mention the marker
+    # text must be preserved (the tag scanner + separate type check must not
+    # over-match non-jsonld scripts).
+    html = (
+        '<script type="application/ld+json">{"@type":"Book","name":"plain"}</script>'
+        '<script>var x = "trainedAlgorithmicMedia";</script>'
+    )
+    _c2, _has_ai, _findings, _ = inspect_html(html)
+    cleaned, actions = clean_html(html)
+    assert cleaned == html
+    assert not any("json-ld" in a for a in actions)
+
+
+def test_html_jsonld_form_feed_is_whitespace():
+    # HTML treats form feed (\f) as whitespace, so it must separate the tag name
+    # from the type attribute rather than being consumed into the tag name.
+    ai = (
+        '<script\ftype="application/ld+json">'
+        '{"@type":"CreativeWork","digitalSourceType":"trainedAlgorithmicMedia"}'
+        "</script>"
+    )
+    _has_c2pa, has_ai, findings, _ = inspect_html(ai)
+    assert has_ai is True
+    assert any("json-ld provenance-like block" in f for f in findings)
+    cleaned, _actions = clean_html(ai)
+    assert "digitalSourceType" not in cleaned
+
+
+def test_html_jsonld_opening_tag_longer_than_2048():
+    # A valid opening tag longer than 2048 characters must still be detected
+    # (no arbitrary length cap on the tag-scan boundary).
+    padding = " ".join(f'data-{i}="x"' for i in range(300))
+    ai = (
+        f'<script {padding} type="application/ld+json">'
+        '{"@type":"Image","digitalSourceType":"trainedAlgorithmicMedia"}'
+        "</script>"
+    )
+    assert len(ai.split(">", 1)[0]) > 2048
+    _has_c2pa, has_ai, findings, _ = inspect_html(ai)
+    assert has_ai is True
+    assert any("json-ld provenance-like block" in f for f in findings)
+    cleaned, _actions = clean_html(ai)
+    assert "digitalSourceType" not in cleaned
+
+
+def test_html_jsonld_gt_in_quoted_attribute_value():
+    # A '>' inside a quoted attribute value must not be treated as the end of
+    # the opening tag.
+    ai = (
+        '<script title="a > b" type="application/ld+json">'
+        '{"@type":"Image","digitalSourceType":"trainedAlgorithmicMedia"}'
+        "</script>"
+    )
+    _has_c2pa, has_ai, findings, _ = inspect_html(ai)
+    assert has_ai is True
+    assert any("json-ld provenance-like block" in f for f in findings)
+    cleaned, _actions = clean_html(ai)
+    assert "digitalSourceType" not in cleaned
+
+
 def test_html_ai_generator_still_dropped():
     html = '<meta name="generator" content="Claude">'
     cleaned, actions = clean_html(html)
