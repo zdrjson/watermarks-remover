@@ -23,7 +23,7 @@ Agent skill + stdlib Python service to strip **multi-vendor AI provenance marks*
 
 Vendors / ecosystems (class-level): **Claude**, **Gemini / SynthID-Text**, **OpenAI** provenance surfaces, **open-LLM** Kirchenbauer-style (green-list) and keyed-Gumbel / EXP (Aaronson) marks.
 
-**Latest release:** [v0.6.0](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.6.0)
+**Latest release:** [v0.7.0](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.7.0)
 
 Skill path: [`skills/remove-ai-marks/`](skills/remove-ai-marks/)  
 Service path: [`service/`](service/)  
@@ -358,6 +358,13 @@ APIs unless you ask it to:
 - **`/clean`** accepts `"detect_before"` / `"detect_after"` options to
   score the input and the cleaned output, so you can measure what a clean
   actually changed.
+- **`/clean`** runs the Layer B text rewrite after Layer A **by default** (it
+  is a required step for text). A **`"strategy"`** option (an ordered
+  `tactic@intensity` list, e.g. `"paraphrase@0.8,mlm@0.2"`) overrides the
+  default from the strategy config file (see below). When the rewrite
+  backend/model for a step isn't configured, `/clean` returns a 400.
+
+Text detectors (see `/capabilities` → `text_detectors`):
 
 Text detectors (see `/capabilities` → `text_detectors`):
 
@@ -416,7 +423,12 @@ Checks `wr-core` via `GET /health` and runs each harness/heavy service with `--h
 
 ### Configuration (env vars for docker compose)
 
-**Nothing is required to clean arbitrary text** — the core service works out of the box:
+**Text cleaning requires Layer B configuration** — the Layer B rewrite is a
+required step for `POST /clean` on text, so the core service needs the rewrite
+backend set up, or text cleaning returns HTTP 400. Image/container metadata
+cleaning works out of the box. For text you must configure the Layer B strategy
+dependencies: `transformers` + `roberta-large` (for the default `mlm` step) and
+the `WATERMARKS_REWRITE_*` LLM config (for the `paraphrase` step):
 
 ```bash
 echo "Hello\u200bWorld\u00ad!" > /tmp/sample.txt
@@ -457,9 +469,11 @@ set -a; . ./.env; set +a; python3 service/scripts/rewrite_text.py /tmp/x.txt -o 
 | `WATERMARKS_REWRITE_API_KEY` | `rewrite_text.py` hook | API key — env only, never on argv |
 | `WATERMARKS_REWRITE_ALLOW_REMOTE` | `rewrite_text.py` hook | `1` to allow non-loopback endpoints |
 | `WATERMARKS_REWRITE_REASONING_EFFORT` | `rewrite_text.py` hook | `none` (default) / `low` / `medium` / `high` / `off` |
+| `WATERMARKS_CLEAN_STRATEGY_FILE` | `server.py` `/clean` | Path to the Layer B strategy config JSON (default `config/clean_strategy.json`) |
 | `WATERMARKS_GUMBEL_KEY` | `detect_gumbel.py` / `text_detectors.py` | Secret key for keyed-Gumbel (EXP) same-key replay (e.g. `0x…`); preferred over argv — never logged |
 
-Layer B is agent-orchestrated in the skill (it rewrites with its own model), so the `WATERMARKS_REWRITE_*` vars are only needed when driving `rewrite_text.py` directly.
+**Layer B is required for text cleaning.** `/clean` always applies the default
+strategy (from `config/clean_strategy.json`, `{"default_strategy": "paraphrase@0.8,mlm@0.2"}`) to a text file after Layer A, unless the request passes its own `"strategy"` option (an ordered `tactic@intensity` list). A strategy step is `tactic@intensity`; the `mlm` step needs `transformers` + `roberta-large`, and any LLM step (`paraphrase`, `humanize`, …) needs the `WATERMARKS_REWRITE_*` config. If the required backend/model isn't configured — or no strategy is available — `/clean` **rejects the request with a 400**. Precedence for the config path: `--strategy-config` CLI flag > `WATERMARKS_CLEAN_STRATEGY_FILE` env var > the default `config/clean_strategy.json`.
 
 Images publish automatically on `v*` tags via [`.github/workflows/release-images.yml`](.github/workflows/release-images.yml).
 
@@ -1156,9 +1170,56 @@ make smoke                          # quick CLI smoke on fixtures
 
 ## Changelog
 
-### Unreleased
+### [v0.7.0](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.7.0) — `/clean` Layer B rewrite, watermark-stealing module, audio/video watermark removal, and benchmark/tooling breadth
 
-- **PNG**: cap decompressed `zTXt` / compressed `iTXt` at 1 MiB (same class of budget as zip members and sitemap gzip). Over-budget chunks are reported on inspect and dropped on clean, including `keep_non_ai_metadata` (GHSA-cfhj-799j-rm4c)
+v0.7.0 brings the Layer B statistical-mark rewrite into the `/clean` service itself, driven by a configurable, benchmark-tuned strategy (`paraphrase@0.8,mlm@0.2`). Alongside it: a black-box watermark-stealing module, destructive audio and per-frame video watermark removal, a substantially richer rewrite benchmark, and a stack of hardening, security, and tooling fixes.
+
+**Layer B rewriting in the service**
+
+- `/clean` runs the Layer B rewrite for text after Layer A. The default comes from `config/clean_strategy.json`; a per-request `options.strategy` overrides it, and `/clean` rejects with 400 when the required backend isn't configured (#315). Config precedence: `--strategy-config` > `WATERMARKS_CLEAN_STRATEGY_FILE` > `config/clean_strategy.json`.
+- New `mlm` rewrite tactic: mask a fraction of content words and infill with `roberta-large` — a non-autoregressive local edit, so the output mixes the original token stream with masked-LM predictions (#311).
+- The `humanize` tactic now applies the humanizer-skill pass deterministically (straight quotes, no em/en dashes, filler collapses, `utilize`→`use`) and names the human-writer rules in the prompt (#311). `rewrite_text.py` gained a `--strategy` CLI path.
+- Rewrite correctness: Unicode word tokenization in lexical divergence (#305); compare raw margins before rounding and record selection metadata / ranked p-values (#249).
+
+**Benchmark**
+
+- SynthID recipe search + robust measurement (#280); renamed rewrite vocabulary, cross-input search, and humanize-last ordering (#302); recommend only strategies that still clear after the humanize polish (#307).
+- Pangram bulk API as a human-likeness backend (#296); hardened minimal-rewrite-level benchmark with a 30-doc corpus (#257); validated weight grid + widened recipe search (#294); Polish benchmark corpus (#295).
+
+**Watermark stealing**
+
+- New black-box watermark-stealing module and prompt-corpus downloader (#303); clear stale state on start-over probe failure (#310).
+
+**Audio / video / image**
+
+- Destructive audio watermark removal chain for silentcipher/AudioSeal/WavMark (tempo + pitch + EQ + low-bitrate re-encode → M4A) (#266).
+- Per-frame TrustMark video purification that collapses the temporal vote (#265).
+- C2PA content-provenance `uuid` box recognized on MP4/MOV/AVIF/HEIC (#264).
+- Preserve truncated MP4 tails during stripping (#242); keep the audio re-encode dest distinct from the container-clean dest (#278).
+- Skip discarded exiftool output and redundant SynthID in the post-clean scan (#261); degrade cleanly when exiftool can't process a PDF (#281).
+- Cap decompressed PNG `zTXt`/`iTXt` at 1 MiB (#308); strip SVG XML DOCTYPE/ENTITY declarations (#288); keep DOCX binary members byte-safe (#314); preserve OOXML `AppVersion` (#289).
+
+**HTTP service & CLI**
+
+- `/clean` option to keep exotic spaces, mirroring the CLI (#274); `/inspect` exposes explicit evidence classes in the suspicious payload (#277); timestamps in HTTP request logs (#256); thread payload bytes into HTTP SynthID scoring and `inspect_*` to avoid a redundant read-back.
+- `clean_file.py` gained `-q`/`--quiet`/`--only-changed` (#254).
+
+**Skills, plugin & hooks**
+
+- Stylometry scoring and detector levers for `clean-user-facing-text` (#258); PostToolUse hook launcher made cross-platform (#255); pre-commit hook treats byte-identical clean non-text files as changed (#238).
+
+**Audit**
+
+- `audit_dir.py` scans source, docs, and i18n files the router walked past (#284); scans `.ts/.tsx/.jsx/.gd` and aligns space confidence across formats (#273); `audit_website.py --sarif` support (#194); harden in-place backups, clean-file status, SynthID verdict, truncated ID3v2, and zip routing (#201).
+
+**Security**
+
+- Remove polynomial ReDoS in data-URI and JSON-LD scans (#306); block HTTP redirects in the SynthID scorer to prevent SSRF (#252).
+
+**CI, tooling & docs**
+
+- CI fails when optional backend requirements can't resolve (#301); Docker image reports ffmpeg as usable and installs Ghostscript (#272); dependency bumps (cython #299, scipy #298, ruff #297, docker/setup-buildx-action #237).
+- Docs: Watermark Detectors section, ETH SRI "Probing SynthID" blog reference, Ecosystem policy (drop ClaudeWatermarks; require listed projects to use this repo) (#292).
 
 ### [v0.6.0](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.6.0) — wider format coverage, Layer A hardening, plugin & hook distribution, and detection-guided rewriting
 

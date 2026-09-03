@@ -93,7 +93,10 @@ clients.
 (`auto` | `always` | `lossless` | `never`, PDF: how hard to chase metadata
 carried inside embedded images; anything else is rejected), `detect_before` / `detect_after` (text and
 images: run watermark detection on the input and on the cleaned output,
-included in the report).
+included in the report), and `strategy` (text: an ordered `tactic@intensity`
+list such as `"paraphrase@0.8,mlm@0.2"` that runs the Layer B rewrite after
+Layer A; when omitted the default from `config/clean_strategy.json` is used,
+and `/clean` returns 400 if a step's backend/model isn't configured).
 
 **Inspect first** (decide, don't guess):
 
@@ -127,7 +130,7 @@ Intended for **your own** content (privacy, hygiene, research). Do not market re
 | --- | --- |
 | Pasted / clipboard text | temp file → `/inspect` then `/clean` (text) |
 | `.txt` / code | text Layer A (+ formatter for code) |
-| `.md` / `.html` | container clean (frontmatter/meta) + Layer A |
+| `.md` / `.html` | container clean (frontmatter/meta) + Layer A; Layer B to the prose via a `/clean` text pass or the agent rewrite model |
 | `.png` / `.jpg` / `.jpeg` / `.webp` / `.avif` / `.heic` / `.bmp` / `.gif` / `.tiff` | image metadata strip |
 | `.svg` / `.pdf` / `.docx` / `.epub` / `.odt` | container metadata strip |
 | Directory / website | aggregate audit via the service CLIs (see below) |
@@ -197,10 +200,18 @@ curl -s -X POST "$WM/clean" -H 'Content-Type: application/json' \
 
 After Layer A, **always propose** a statistical-mark reduction pass for natural-language content. Do not skip this step silently.
 
-The service does **not** hold a rewrite model — **you** are the rewrite model.
-Run the prompts below on the cleaned text with a model **≠ suspected origin**
-(Claude text → not Claude; Gemini → not Gemini; etc.). Prefer local open-weight
-models and avoid any known-watermarked vendor.
+For **plain text** (pasted / `.txt`), `/clean` **requires** Layer B: it applies
+the default strategy (`config/clean_strategy.json`, e.g.
+`paraphrase@0.8,mlm@0.2`) or the `options.strategy` override after Layer A,
+reports `report.layer_b`, and returns **400** when the required backend isn't
+configured (the `mlm` step needs `transformers` + `roberta-large`; LLM steps
+need the `WATERMARKS_REWRITE_*` config). Markdown/HTML and other containers
+(`.md`, `.html`, `.pdf`, `.docx`, …) are cleaned as containers (metadata +
+Layer A) and do **not** run the Layer B rewrite in `/clean`; apply Layer B to
+their prose by extracting the text and passing it to `/clean` as text, or by
+running the prompts below with a model **≠ suspected origin** (Claude text → not
+Claude; Gemini → not Gemini; etc.). Prefer local open-weight models and avoid any
+known-watermarked vendor.
 
 Multi-pass recipe:
 
