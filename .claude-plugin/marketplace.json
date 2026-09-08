@@ -11,7 +11,7 @@
       "source": "./",
       "displayName": "Watermarks Remover",
       "description": "Remove multi-vendor AI provenance marks from text, images, documents, and media. Bundles the remove-ai-marks and clean-user-facing-text skills.",
-      "version": "0.5.0",
+      "version": "0.7.0",
       "author": {
         "name": "watermarks-remover contributors",
         "url": "https://github.com/guillaumemeyer/watermarks-remover"

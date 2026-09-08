@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "watermarks-remover",
   "displayName": "Watermarks Remover",
-  "version": "0.5.0",
+  "version": "0.7.0",
   "description": "Remove multi-vendor AI provenance marks: invisible Unicode (Layer A), statistical text watermarks via rewrite (Layer B), and C2PA/EXIF/XMP/container metadata on images, documents, and media. Ships the remove-ai-marks skill (thin client over the repo's HTTP service) and the self-contained clean-user-facing-text skill.",
   "author": {
     "name": "watermarks-remover contributors",
