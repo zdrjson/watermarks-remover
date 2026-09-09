@@ -69,7 +69,13 @@ from common import (
     subprocess_preexec_fn,
     which,
 )
-from container_meta import DEEP_IMAGE_MODES, clean_container, inspect_container
+from container_meta import (
+    CLEAN_ATTACHMENT_MODES,
+    DEEP_IMAGE_MODES,
+    DEFAULT_CLEAN_ATTACHMENTS,
+    clean_container,
+    inspect_container,
+)
 from format_dispatch import classify_bytes
 from image_meta import clean_image, inspect_image, run_synthid_score, synthid_is_watermarked
 from score_stylometry import score_text_stylometry
@@ -108,6 +114,7 @@ ALLOWED_CLEAN_OPTIONS = {
     "detect_before": bool,
     "detect_after": bool,
     "deep_images": str,
+    "clean_attachments": str,
     "style": str,
     "strategy": str,
 }
@@ -917,6 +924,11 @@ def _parse_clean_options(options: Any) -> dict[str, Any]:
     deep_images = options.get("deep_images")
     if deep_images is not None and deep_images not in DEEP_IMAGE_MODES:
         raise ValueError(f"option 'deep_images' must be one of {sorted(DEEP_IMAGE_MODES)}")
+    clean_attachments = options.get("clean_attachments")
+    if clean_attachments is not None and clean_attachments not in CLEAN_ATTACHMENT_MODES:
+        raise ValueError(
+            f"option 'clean_attachments' must be one of {sorted(CLEAN_ATTACHMENT_MODES)}"
+        )
     # A per-request strategy overrides the default; validate it up front so a bad
     # tactic/intensity is a 400 rather than a mid-clean failure.
     if "strategy" in options:
@@ -1371,6 +1383,7 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
                 fmt=container_fmt,
                 also_layer_a_text=bool(options.get("also_layer_a_text", True)),
                 deep_images=str(options.get("deep_images", "auto")),
+                clean_attachments=str(options.get("clean_attachments", DEFAULT_CLEAN_ATTACHMENTS)),
                 normalize_spaces=bool(options.get("normalize_spaces", True)),
             )
             cleaned_bytes = dest.read_bytes()

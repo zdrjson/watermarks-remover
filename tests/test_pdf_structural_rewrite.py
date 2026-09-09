@@ -68,6 +68,10 @@ def _fake_tools(monkeypatch, *, qpdf: bool, qpdf_rc: int = 0, qpdf_writes: bool 
     def fake_run(cmd, **kwargs):
         seen.append(list(cmd))
         if cmd[0].endswith("qpdf"):
+            # The attachment pass lists embedded files with --json; answer with
+            # no attachments rather than clobbering the source file.
+            if "--json-key=attachments" in cmd:
+                return _Completed(0, stdout='{"attachments": {}}')
             if qpdf_writes:
                 # qpdf writes its rebuilt document to the final argument.
                 Path(cmd[-1]).write_bytes(b"%PDF-1.4\n% rebuilt\n%%EOF\n")
@@ -107,9 +111,11 @@ def test_with_qpdf_the_document_is_rebuilt(monkeypatch, tmp_path: Path):
     _actions, meta = clean_pdf(src, dest)
 
     assert meta["structural_rewrite"] is True
-    qpdf_cmd = [c for c in seen if c[0].endswith("qpdf")]
-    assert len(qpdf_cmd) == 1
-    assert "--linearize" in qpdf_cmd[0]
+    # The attachment pass also shells out to qpdf to list embedded files, so
+    # filter for the structural-rewrite invocation specifically.
+    linearize_cmd = [c for c in seen if c[0].endswith("qpdf") and "--linearize" in c]
+    assert len(linearize_cmd) == 1
+    assert "--linearize" in linearize_cmd[0]
     # The rebuilt file must replace the exiftool output, not sit beside it.
     assert dest.read_bytes() == b"%PDF-1.4\n% rebuilt\n%%EOF\n"
     assert not list(tmp_path.glob("*.qpdf-tmp"))

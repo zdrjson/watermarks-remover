@@ -369,6 +369,35 @@ def test_known_deep_images_modes_accepted(conn):
         assert status == 200, mode
 
 
+def test_unknown_clean_attachments_mode_rejected(conn):
+    """A typo must answer 400, not silently fall back to auto."""
+    status, body = _post(
+        conn,
+        "/clean",
+        {
+            "file": _b64(b"x"),
+            "name": "x.txt",
+            "options": {"clean_attachments": "sometime"},
+        },
+    )
+    assert status == 400
+    assert "clean_attachments" in body["error"]
+
+
+def test_known_clean_attachments_modes_accepted(conn):
+    for mode in sorted(container_meta.CLEAN_ATTACHMENT_MODES):
+        status, _body = _post(
+            conn,
+            "/clean",
+            {
+                "file": _b64(b"plain text\n"),
+                "name": "x.txt",
+                "options": {"clean_attachments": mode},
+            },
+        )
+        assert status == 200, mode
+
+
 @pytest.mark.parametrize(
     ("key", "value", "type_name"),
     [

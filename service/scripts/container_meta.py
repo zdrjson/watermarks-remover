@@ -5,12 +5,16 @@ Stdlib-first; PDF prefers optional exiftool/c2patool when present.
 """
 
 import base64
+import bisect
+import contextlib
 import io
+import json
 import os
 import posixpath
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.parse
 import zipfile
@@ -221,6 +225,8 @@ def detect_container_format(path: Path, data: bytes | None = None) -> str:
         return "html"
     if ext in (".md", ".markdown", ".mdx"):
         return "markdown"
+    if ext in (".tex", ".ltx"):
+        return "latex"
     if data is not None:
         if data[:4] == b"%PDF":
             return "pdf"
@@ -649,6 +655,528 @@ def clean_markdown(text: str) -> tuple[str, list[str]]:
     if not actions:
         actions.append("no AI frontmatter keys or embedded data URIs removed")
     return out, actions
+
+
+# ---------------------------------------------------------------------------
+# LaTeX (.tex / .ltx)
+# ---------------------------------------------------------------------------
+#
+# A LaTeX source carries provenance as compile-time PDF metadata (\hypersetup
+# and \pdfinfo) and as markup comments (header blocks, % !TEX tooling comments,
+# Emacs/Vim modelines). inspect_latex/clean_latex mirror the markdown handlers:
+# inspect reports which of these carry AI/provenance markers, clean removes them
+# (aggressively: always-clear provenance field names, not only AI-named keys).
+
+_C2PA_RE = re.compile(r"c2pa|content.?credential|contentcredential", re.I)
+# \hypersetup keys that become document metadata; cleared regardless of value.
+_CLEAR_HYPER_KEYS: frozenset[str] = frozenset(
+    {
+        "pdfauthor",
+        "pdfsubject",
+        "pdfcreator",
+        "pdfproducer",
+        "pdfkeywords",
+        "pdfcreationdate",
+        "pdfmoddate",
+    }
+)
+# \pdfinfo keys (leading '/' optional) that are provenance/dates; cleared always.
+_CLEAR_PDFINFO_KEYS: frozenset[str] = frozenset(
+    {"author", "subject", "keywords", "creator", "producer", "creationdate", "moddate"}
+)
+_META_CMD_OPEN_RE = re.compile(r"\\(hypersetup|pdfinfo)\b\s*\{")
+_LATEX_MAGIC_COMMENT_RE = re.compile(r"%\s*!\s*(?:TEX|TeX|BIB|LaTeX)\b")
+_LATEX_VIM_MODELINE_RE = re.compile(r"\bvim\s*:", re.I)
+# Verbatim/listings content and inline \verb / \lstinline spans are literal
+# document body, never live metadata, so metadata commands there must not be
+# cleaned (a \hypersetup shown as an example must survive).
+_VERBATIM_ENV_BEGIN_RE = re.compile(r"\\begin\{(verbatim\*?|lstlisting\*?|minted|Verbatim)\}", re.I)
+_VERBATIM_ENV_END_RE = re.compile(r"\\end\{(verbatim\*?|lstlisting\*?|minted|Verbatim)\}", re.I)
+_INLINE_VERBATIM_RE = re.compile(r"\\(verb\*?|lstinline\*?)(.)", re.I)
+
+
+def _is_latex_escaped(text: str, index: int) -> bool:
+    r"""True if text[index] is preceded by an odd number of backslashes.
+
+    ``\x`` escapes ``x``; ``\\`` is a linebreak. A '%' after an even (or zero)
+    backslash count starts a comment, after an odd count is a literal percent.
+    """
+    count = 0
+    j = index - 1
+    while j >= 0 and text[j] == "\\":
+        count += 1
+        j -= 1
+    return count % 2 == 1
+
+
+def _latex_comment_ranges(text: str) -> list[tuple[int, int]]:
+    r"""Return [start, end) ranges that are % comments (to end of line).
+
+    A '%' starts a comment unless preceded by an odd number of backslashes
+    (\% is an escaped percent sign; \\% is a linebreak followed by a comment).
+    Used to avoid treating a \hypersetup/\pdfinfo that appears *inside* a
+    comment as a live metadata command.
+    """
+    ranges: list[tuple[int, int]] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] == "%" and not _is_latex_escaped(text, i):
+            start = i
+            j = text.find("\n", i)
+            end = n if j < 0 else j
+            ranges.append((start, end))
+            i = end
+        else:
+            i += 1
+    return ranges
+
+
+def _latex_verbatim_ranges(text: str) -> list[tuple[int, int]]:
+    r"""Return [start, end) ranges of verbatim/listings content to skip.
+
+    Covers verbatim/verbatim*/lstlisting/minted/Verbatim environments and
+    inline \verb / \verb* / \lstinline spans (delimiter follows the command).
+    """
+    ranges: list[tuple[int, int]] = []
+    for m in _VERBATIM_ENV_BEGIN_RE.finditer(text):
+        endm = _VERBATIM_ENV_END_RE.search(text, m.end())
+        if endm:
+            ranges.append((m.start(), endm.end()))
+    for m in _INLINE_VERBATIM_RE.finditer(text):
+        delim = m.group(2)
+        start = m.end()
+        # \lstinline may carry a '[language=...]' option group before the real
+        # delimiter, e.g. \lstinline[language=C]|code|. Skip the group and never
+        # treat '[' as a delimiter so the following delimiter is used. The scan
+        # is brace-aware (a braced value may contain ']', e.g. caption={a]b}).
+        if m.group(1).startswith("lstinline") and delim == "[":
+            close = -1
+            depth = 0
+            j = m.end()
+            while j < len(text):
+                ch = text[j]
+                if ch == "\\":
+                    j += 2
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                elif ch == "]" and depth == 0:
+                    close = j
+                    break
+                j += 1
+            if close < 0 or close + 1 >= len(text):
+                continue
+            start = close + 2
+            delim = text[close + 1]
+        if delim.isspace() or delim.isalnum() or delim in "\\{}":
+            continue
+        k = text.find(delim, start)
+        end = len(text) if k < 0 else k + 1
+        ranges.append((m.start(), end))
+    return ranges
+
+
+def _latex_merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Sort and merge overlapping/nested [start, end) ranges.
+
+    A nested range (e.g. an inline \\verb span inside a verbatim environment)
+    would otherwise become the predecessor of the binary-search lookup and
+    hide the enclosing range from it.
+    """
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges, key=lambda r: r[0]):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _latex_line_iter_with_verbatim(text: str) -> Iterator[tuple[int, str, bool]]:
+    """Yield (offset, line, in_verbatim) for each line.
+
+    Flags lines that fall inside a verbatim/listings range so the % comment
+    passes in inspect_latex/clean_latex preserve literal percent-prefixed lines
+    in a verbatim or listings block.
+    """
+    ranges = _latex_merge_ranges(_latex_verbatim_ranges(text))
+    starts = [r[0] for r in ranges]
+    off = 0
+    for line in text.split("\n"):
+        idx = bisect.bisect_right(starts, off) - 1
+        in_vb = idx >= 0 and off < ranges[idx][1]
+        yield off, line, in_vb
+        off += len(line) + 1
+
+
+def _latex_matching_brace(text: str, open_idx: int) -> int:
+    r"""Return the '}' matching text[open_idx] == '{', or -1.
+
+    LaTeX % comments are skipped (an unescaped % runs to end of line), so a
+    '}' inside a comment cannot prematurely close the block.
+    """
+    depth = 0
+    i = open_idx
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "%" and not _is_latex_escaped(text, i):
+            j = text.find("\n", i)
+            if j < 0:
+                break
+            i = j + 1
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _latex_split_items(s: str) -> list[str]:
+    r"""Split a \hypersetup argument into top-level key=value item strings.
+
+    Commas at brace depth 0 delimit items; % comments are removed from the items
+    so a comment's comma/braces neither split nor affect a neighboring key.
+    Quotes are ordinary characters (no quote-mode state), so an apostrophe in a
+    title does not hide a following ','.
+    """
+    items: list[str] = []
+    depth = 0
+    cur: list[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            cur.append(s[i : i + 2])
+            i += 2
+            continue
+        if c == "%" and not _is_latex_escaped(s, i):
+            j = s.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if c == "{":
+            depth += 1
+            cur.append(c)
+            i += 1
+            continue
+        if c == "}":
+            depth -= 1
+            cur.append(c)
+            i += 1
+            continue
+        if c == "," and depth == 0:
+            items.append("".join(cur))
+            cur = []
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+    items.append("".join(cur))
+    return items
+
+
+def _latex_split_key_value(item: str) -> tuple[str, str | None]:
+    r"""Split a \hypersetup 'key=value' item at the first top-level '='.
+
+    Quotes are ordinary characters (no quote-mode state), so an apostrophe in a
+    value does not conceal the '=' that follows it.
+    """
+    depth = 0
+    i, n = 0, len(item)
+    while i < n:
+        c = item[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "{":
+            depth += 1
+            i += 1
+            continue
+        if c == "}":
+            depth -= 1
+            i += 1
+            continue
+        if c == "=" and depth == 0:
+            return item[:i].strip(), item[i + 1 :].strip()
+        i += 1
+    return item.strip(), None
+
+
+def _latex_pdfinfo_items(arg: str) -> list[tuple[str, str, int, int]]:
+    r"""Yield (key, value, value_start, value_end) for each '/Name ...' entry.
+
+    \pdfinfo entries are whitespace-separated '/Key <value>' pairs whose value is
+    a parenthesized string (may contain spaces and escaped parens), a <hex> string,
+    or a bare token (e.g. /False).
+    """
+    items: list[tuple[str, str, int, int]] = []
+    i, n = 0, len(arg)
+    while i < n:
+        while i < n and arg[i].isspace():
+            i += 1
+        if i < n and arg[i] == "%" and not _is_latex_escaped(arg, i):
+            j = arg.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if i >= n or arg[i] != "/":
+            i += 1
+            continue
+        key_start = i
+        i += 1
+        while i < n and not arg[i].isspace():
+            i += 1
+        key = arg[key_start:i]
+        while i < n and arg[i].isspace():
+            i += 1
+        value_start = i
+        if i < n and arg[i] == "(":
+            depth = 0
+            while i < n:
+                if arg[i] == "\\":
+                    i += 2
+                    continue
+                if arg[i] == "(":
+                    depth += 1
+                elif arg[i] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        i += 1
+                        break
+                i += 1
+        elif i < n and arg[i] == "<":
+            i += 1
+            while i < n and arg[i] != ">":
+                i += 1
+            if i < n:
+                i += 1
+        else:
+            while i < n and not arg[i].isspace():
+                i += 1
+        items.append((key, arg[value_start:i], value_start, i))
+    return items
+
+
+def _latex_entry_class(key: str, value: str | None) -> tuple[bool, bool, bool]:
+    r"""Return (ai, c2pa, clear) for one \hypersetup/\pdfinfo entry."""
+    lkey = key.lower().lstrip("/")
+    ai = bool(AI_META_NAME_RE.search(key) or (value and AI_META_NAME_RE.search(value)))
+    c2pa = bool(_C2PA_RE.search(key) or (value and _C2PA_RE.search(value)))
+    clear = lkey in _CLEAR_HYPER_KEYS or lkey in _CLEAR_PDFINFO_KEYS
+    return ai, c2pa, clear
+
+
+def _latex_clean_hypersetup(arg: str) -> tuple[str | None, list[tuple[str, bool, bool]]]:
+    r"""Drop provenance entries from a \hypersetup argument.
+
+    Returns (new_arg, removed) where new_arg is None when the block should be
+    dropped entirely, and removed is [(key, ai, c2pa), ...] for the entries
+    cleared (AI/C2PA-provenance keys and values, plus the always-clear metadata
+    field names).
+    """
+    kept: list[str] = []
+    removed: list[tuple[str, bool, bool]] = []
+    for raw in _latex_split_items(arg):
+        item = raw.strip()
+        if not item:
+            continue
+        key, value = _latex_split_key_value(item)
+        if key is None:
+            kept.append(item)
+            continue
+        ai, c2pa, clear = _latex_entry_class(key, value)
+        if ai or c2pa or clear:
+            removed.append((key, ai, c2pa))
+            continue
+        kept.append(item)
+    if not removed:
+        return arg, []
+    if not kept:
+        return None, removed
+    return ", ".join(kept), removed
+
+
+def _latex_clean_pdfinfo(arg: str) -> tuple[str | None, list[tuple[str, bool, bool]]]:
+    r"""Drop provenance entries from a \pdfinfo argument.
+
+    Returns (new_arg, removed) with the same contract as _latex_clean_hypersetup;
+    the always-clear /Author /Creator /Producer /Subject /Keywords /CreationDate
+    /ModDate fields and any AI/C2PA-marker entry are removed, /Title is kept.
+    """
+    kept: list[str] = []
+    removed: list[tuple[str, bool, bool]] = []
+    for key, value, _vs, _ve in _latex_pdfinfo_items(arg):
+        ai, c2pa, clear = _latex_entry_class(key, value)
+        if ai or c2pa or clear:
+            removed.append((key, ai, c2pa))
+            continue
+        kept.append(key if not value else f"{key} {value}")
+    if not removed:
+        return arg, []
+    if not kept:
+        return None, removed
+    return " ".join(kept), removed
+
+
+def _latex_comment_class(line: str) -> tuple[bool, str, bool]:
+    """Return (drop, label, ai) for a comment line (line already stripped).
+
+    Aggressive: drop AI-provenance comment lines, % !TEX tooling comments, and
+    Emacs/Vim modelines. Ordinary documentation comments survive.
+    """
+    if AI_META_NAME_RE.search(line):
+        return True, "AI markers", True
+    if _LATEX_MAGIC_COMMENT_RE.search(line):
+        return True, "magic comment", False
+    if "-*-" in line:
+        return True, "editor modeline", False
+    if _LATEX_VIM_MODELINE_RE.search(line):
+        return True, "editor modeline", False
+    return False, "", False
+
+
+def _latex_iter_meta_commands(text: str):
+    r"""Yield (cmd, arg, start, end) for each live \hypersetup/\pdfinfo block.
+
+    Skips % comments and verbatim/listings content (so a \hypersetup shown as a
+    literal example is not treated as live metadata) and inline \verb/\lstinline
+    spans. The comment/verbatim ranges are merged and looked up with a binary
+    search, so an adversarial run of commands costs O(log n) per command.
+    """
+    ranges = _latex_comment_ranges(text)
+    ranges.extend(_latex_verbatim_ranges(text))
+    # A comment or inline-verbatim range nested inside a verbatim block would
+    # otherwise hide the enclosing verbatim range from the predecessor lookup,
+    # so merge overlapping/nested intervals before the binary search.
+    ranges = _latex_merge_ranges(ranges)
+    starts = [r[0] for r in ranges]
+    for m in _META_CMD_OPEN_RE.finditer(text):
+        pos = m.start()
+        idx = bisect.bisect_right(starts, pos) - 1
+        if idx >= 0 and pos < ranges[idx][1]:
+            continue
+        cmd = m.group(1).lower()
+        brace_idx = m.end() - 1
+        close = _latex_matching_brace(text, brace_idx)
+        if close < 0:
+            continue
+        yield cmd, text[brace_idx + 1 : close], m.start(), close + 1
+
+
+def _latex_meta_key_values(cmd: str, arg: str) -> list[tuple[str, str | None]]:
+    r"""Extract (key, value) pairs from a \hypersetup or \pdfinfo argument."""
+    if cmd == "pdfinfo":
+        return [(key, value) for key, value, _vs, _ve in _latex_pdfinfo_items(arg)]
+    pairs: list[tuple[str, str | None]] = []
+    for raw in _latex_split_items(arg):
+        item = raw.strip()
+        if not item:
+            continue
+        key, value = _latex_split_key_value(item)
+        pairs.append((key, value) if key is not None else (item, None))
+    return pairs
+
+
+def inspect_latex(text: str) -> tuple[bool, bool, list[str], dict]:
+    r"""Inspect a LaTeX source for provenance/AI metadata and tooling comments.
+
+    Returns (has_c2pa, has_ai, findings, details); details carries command and
+    dropped-entry counts. Skips % comments and verbatim/listings content so
+    only live \hypersetup/\pdfinfo metadata and literal comment lines are seen.
+    """
+    findings: list[str] = []
+    has_ai = False
+    has_c2pa = False
+    keys_dropped = 0
+    comments_dropped = 0
+    commands = 0
+    for cmd, arg, _s, _e in _latex_iter_meta_commands(text):
+        commands += 1
+        for key, value in _latex_meta_key_values(cmd, arg):
+            ai, c2pa, clear = _latex_entry_class(key, value)
+            if not (ai or c2pa or clear):
+                continue
+            keys_dropped += 1
+            prefix = "latex ai:" if (ai or c2pa) else "info: latex"
+            findings.append(f"{prefix} {cmd} {key}")
+            if c2pa:
+                has_c2pa = True
+            if ai or c2pa:
+                has_ai = True
+    for _off, line, in_verbatim in _latex_line_iter_with_verbatim(text):
+        stripped = line.lstrip()
+        if in_verbatim or not stripped.startswith("%"):
+            continue
+        drop, label, ai = _latex_comment_class(stripped)
+        if drop:
+            comments_dropped += 1
+            prefix = "latex ai:" if ai else "info: latex"
+            findings.append(f"{prefix} comment ({label})")
+            if ai:
+                has_ai = True
+    details = {
+        "commands": commands,
+        "keys_dropped": keys_dropped,
+        "comments_dropped": comments_dropped,
+    }
+    return has_c2pa, has_ai or has_c2pa, findings, details
+
+
+def clean_latex(text: str) -> tuple[str, list[str]]:
+    r"""Strip LaTeX provenance metadata from a source.
+
+    Removes \hypersetup/\pdfinfo provenance entries and drops provenance-bearing
+    % comments plus % !TEX tooling comments and Emacs/Vim modelines. Verbatim and
+    listings content is left untouched. Returns (text, actions).
+    """
+    actions: list[str] = []
+    out: list[str] = []
+    last = 0
+    for cmd, arg, start, end in _latex_iter_meta_commands(text):
+        out.append(text[last:start])
+        if cmd == "hypersetup":
+            new_arg, removed = _latex_clean_hypersetup(arg)
+        else:
+            new_arg, removed = _latex_clean_pdfinfo(arg)
+        if new_arg is None:
+            actions.append(f"drop {cmd} block")
+        else:
+            out.append(f"\\{cmd}{{{new_arg}}}")
+            for key, _ai, _c2pa in removed:
+                actions.append(f"drop {cmd} {key.lower().lstrip('/')}")
+        last = end
+    out.append(text[last:])
+    text = "".join(out)
+
+    kept_lines: list[str] = []
+    dropped = 0
+    for _off, line, in_verbatim in _latex_line_iter_with_verbatim(text):
+        if in_verbatim:
+            kept_lines.append(line)
+            continue
+        stripped = line.lstrip()
+        drop, label, _ai = (
+            _latex_comment_class(stripped) if stripped.startswith("%") else (False, "", False)
+        )
+        if drop:
+            dropped += 1
+            actions.append(f"drop comment: {label}")
+            continue
+        kept_lines.append(line)
+    if dropped:
+        text = "\n".join(kept_lines)
+
+    if not actions:
+        actions.append("no LaTeX metadata removed")
+    return text, actions
 
 
 # ---------------------------------------------------------------------------
@@ -2385,7 +2913,14 @@ def _pdf_structured_blob(data: bytes) -> bytes:
     return no_streams + b"\n" + xmp
 
 
-def inspect_pdf(path: Path, data: bytes) -> tuple[bool, bool, list[str], dict]:
+def inspect_pdf(
+    path: Path,
+    data: bytes,
+    *,
+    depth: int = 0,
+    include_attachments: bool = True,
+    deadline: "_Deadline | None" = None,
+) -> tuple[bool, bool, list[str], dict]:
     findings: list[str] = []
     has_c2pa, has_ai, hits = _blob_hits(_pdf_structured_blob(data))
     findings.extend(f"pdf-structured:{h}" for h in hits)
@@ -2411,7 +2946,31 @@ def inspect_pdf(path: Path, data: bytes) -> tuple[bool, bool, list[str], dict]:
     probe_note = c2patool_probe_note(tools)
     if probe_note:
         findings.append(probe_note)
-    return has_c2pa, has_ai or has_c2pa, findings, {"tools": tools}
+
+    # Embedded-file attachments are stream payloads, so the deterministic scan
+    # above deliberately cannot see them. Extract and inspect each one the same
+    # way we would a standalone file. Callers deciding whether to run the
+    # Ghostscript deep-image pass pass ``include_attachments=False`` so an
+    # attachment-only marker does not trigger a re-distill that would drop the
+    # attachments themselves.
+    details: dict[str, Any] = {"tools": tools}
+    if include_attachments:
+        if deadline is None:
+            deadline = _Deadline(PDF_CLEAN_BUDGET_SECONDS)
+        attachments, truncated = _pdf_inspect_attachments(path, deadline, depth=depth)
+        if attachments:
+            for a in attachments:
+                findings.append(f"attachment:{a['name']}:{a.get('kind', 'unknown')}")
+                if a.get("has_ai_metadata"):
+                    has_ai = True
+                    findings.append(f"attachment:{a['name']}:AI metadata")
+                if a.get("has_c2pa"):
+                    has_c2pa = True
+                    findings.append(f"attachment:{a['name']}:C2PA")
+            details["attachments"] = attachments
+            if truncated:
+                details["attachments_truncated"] = True
+    return has_c2pa, has_ai or has_c2pa, findings, details
 
 
 def _blank_xmp_packets(data: bytes) -> tuple[bytes, int]:
@@ -2754,7 +3313,521 @@ def _run_ghostscript(
     return True
 
 
-def clean_pdf(path: Path, dest: Path, *, deep_images: str = "auto") -> tuple[list[str], dict]:
+# ---------------------------------------------------------------------------
+# PDF embedded-file attachments
+# ---------------------------------------------------------------------------
+
+CLEAN_ATTACHMENT_MODES = frozenset({"auto", "always", "never"})
+DEFAULT_CLEAN_ATTACHMENTS = "always"
+MAX_ATTACHMENT_DEPTH = 3
+MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
+_QPDF_ATTACH_TIMEOUT = 60.0
+
+
+def _pdf_iso_to_pdf_date(iso: str | None) -> str | None:
+    """Convert an ISO-8601 (or native PDF-date) timestamp to qpdf's PDF date form.
+
+    ``qpdf --json`` reports attachment dates in ISO-8601, but some qpdf outputs
+    hand back the native ``D:YYYYMMDDHHMMSS±HH'MM'`` form. Accept both so the
+    original timestamps survive re-embedding. ``None`` or an unparseable string
+    returns ``None`` so callers can simply omit the date option and let qpdf
+    stamp "now" rather than erroring.
+    """
+    if not iso:
+        return None
+    if re.match(r"^D:\d{14}.*$", iso):
+        # Already in qpdf's expected form; return as-is for round-tripping.
+        return iso
+    # qpdf reports the offset form (…-08:00) or normalizes UTC to a "Z" suffix.
+    m = re.match(
+        r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:([+-])(\d{2}):(\d{2})|Z)",
+        iso,
+    )
+    if not m:
+        return None
+    y, mo, d, h, mi, s, sign, oh, om = m.groups()
+    if sign is None:  # "Z" == UTC
+        sign, oh, om = "+", "00", "00"
+    return f"D:{y}{mo}{d}{h}{mi}{s}{sign}{oh}'{om}'"
+
+
+def _pdf_attachment_list(path: Path, deadline: "_Deadline | None" = None) -> list[dict]:
+    """Enumerate a PDF's embedded files via ``qpdf --json``.
+
+    Returns a list of ``{key, name, mimetype, description, creationdate,
+    modificationdate}`` in PDF order. Empty when qpdf is absent, the budget is
+    spent, or the PDF carries no attachments.
+    """
+    qpdf = which("qpdf")
+    if not qpdf:
+        return []
+    if deadline is not None and deadline.spent():
+        return []
+    try:
+        r = subprocess.run(
+            [qpdf, "--json", "--json-key=attachments", "--", safe_arg(str(path))],
+            capture_output=True,
+            text=True,
+            timeout=(
+                _QPDF_ATTACH_TIMEOUT if deadline is None else deadline.timeout(_QPDF_ATTACH_TIMEOUT)
+            ),
+            check=False,
+            preexec_fn=subprocess_preexec_fn,
+            creationflags=subprocess_creationflags,
+        )
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    try:
+        payload = json.loads(r.stdout)
+    except Exception:
+        return []
+    out: list[dict] = []
+    for key, info in (payload.get("attachments") or {}).items():
+        if not isinstance(info, dict):
+            continue
+        names = info.get("names") or {}
+        streams = info.get("streams") or {}
+        stream = next(iter(streams.values()), {}) if streams else {}
+        out.append(
+            {
+                "key": key,
+                "name": info.get("preferredname") or key,
+                "mimetype": stream.get("mimetype") or None,
+                "description": info.get("description"),
+                "creationdate": stream.get("creationdate"),
+                "modificationdate": stream.get("modificationdate"),
+                "named_F": names.get("/F"),
+                "named_UF": names.get("/UF"),
+            }
+        )
+    return out
+
+
+def _watchdog_kill(process: "subprocess.Popen[bytes]", seconds: float) -> threading.Event:
+    """Return a stop Event; a daemon thread kills *process* unless it is set.
+
+    The main thread reads qpdf's stdout in chunks; this watchdog enforces the
+    timeout on a read that would otherwise block forever (e.g. a hung qpdf that
+    produces no output), since the inter-chunk deadline check never fires then.
+    """
+    stop = threading.Event()
+
+    def _watch() -> None:
+        if not stop.wait(seconds):
+            with contextlib.suppress(OSError):  # already exited/reaped
+                process.kill()
+
+    threading.Thread(target=_watch, daemon=True).start()
+    return stop
+
+
+def _pdf_show_attachment(path: Path, key: str, tmp: Path, deadline: "_Deadline | None") -> int:
+    """Extract one embedded file to *tmp*, bounding the write to the size cap.
+
+    Returns the byte count on success (``<= MAX_ATTACHMENT_BYTES``),
+    ``MAX_ATTACHMENT_BYTES + 1`` when the attachment exceeds the cap (the
+    subprocess is terminated and *tmp* is left partial), or ``-1`` on failure.
+    qpdf's output is consumed in bounded chunks so an embedded stream that
+    expands well past the cap is not written to disk in full before being
+    rejected, and a watchdog enforces the deadline/``_QPDF_ATTACH_TIMEOUT`` even
+    when qpdf stops producing output.
+    """
+    qpdf = which("qpdf")
+    if not qpdf:
+        return -1
+    limit = MAX_ATTACHMENT_BYTES
+    total = 0
+    timeout = _QPDF_ATTACH_TIMEOUT if deadline is None else deadline.timeout(_QPDF_ATTACH_TIMEOUT)
+    try:
+        with tmp.open("wb") as out:
+            p = subprocess.Popen(
+                [qpdf, f"--show-attachment={key}", "--", safe_arg(str(path))],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                # Same preexec_fn resource-limit guard used by every subprocess
+                # in this module; the bounded read+kill below also caps qpdf's
+                # output.
+                preexec_fn=subprocess_preexec_fn,  # noqa: PLW1509
+                creationflags=subprocess_creationflags,
+            )
+            stop = _watchdog_kill(p, timeout)
+            try:
+                rc = None
+                while True:
+                    if deadline is not None and deadline.spent():
+                        p.kill()
+                        return -1
+                    chunk = p.stdout.read(1 << 20)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > limit:
+                        p.kill()
+                        return limit + 1
+                    out.write(chunk)
+                p.stdout.close()
+                rc = p.wait(timeout=max(0.1, timeout))
+            finally:
+                stop.set()
+                p.stdout.close()
+                if p.poll() is None:
+                    p.kill()
+                    p.wait()
+    except Exception:
+        return -1
+    if rc != 0:
+        return -1
+    return total
+
+
+def _classify_attachment(name: str, data: bytes) -> str:
+    """Route an attachment to the same pipelines as a standalone file."""
+    from format_dispatch import classify_bytes  # local: avoids an import cycle
+
+    return classify_bytes(data, Path(name).suffix)
+
+
+def _pdf_inspect_attachments(
+    path: Path, deadline: "_Deadline | None", depth: int = 0
+) -> tuple[list[dict], bool]:
+    """Inspect each embedded file and report its own provenance.
+
+    Returns ``(attachments, truncated)`` where each attachment is
+    ``{name, mimetype, key, kind, has_c2pa, has_ai_metadata, findings}``.
+    ``truncated`` is true when the scan stopped at the depth cap or budget so
+    callers can report an incomplete rather than "clean" answer.
+    """
+    if depth > MAX_ATTACHMENT_DEPTH:
+        return [], True
+    if deadline is not None and deadline.spent():
+        return [], True
+    attachments = _pdf_attachment_list(path, deadline)
+    results: list[dict] = []
+    truncated = False
+    with tempfile.TemporaryDirectory(prefix="wr-att-insp-") as staging:
+        for i, att in enumerate(attachments):
+            # Sanitise the temp name: keep the suffix so classification works,
+            # drop any directory separators in the attachment's own name.
+            safe_name = Path(att["name"]).name or f"att-{i}"
+            tmp = Path(staging) / f"att-{i}{Path(safe_name).suffix}"
+            n = _pdf_show_attachment(path, att["key"], tmp, deadline)
+            if n < 0:
+                results.append({**att, "kind": "unknown", "error": "extract failed"})
+                continue
+            if n > MAX_ATTACHMENT_BYTES:
+                results.append({**att, "kind": "unknown", "error": "attachment too large"})
+                truncated = True
+                continue
+            data = tmp.read_bytes()
+            kind = _classify_attachment(att["name"], data)
+            has_c2pa, has_ai, findings = _inspect_attachment_bytes(tmp, data, kind, depth, deadline)
+            results.append(
+                {
+                    **att,
+                    "kind": kind,
+                    "has_c2pa": has_c2pa,
+                    "has_ai_metadata": has_ai,
+                    "findings": findings,
+                }
+            )
+            if deadline is not None and deadline.spent():
+                truncated = True
+                break
+    return results, truncated
+
+
+def _inspect_attachment_bytes(
+    tmp: Path, data: bytes, kind: str, depth: int, deadline: "_Deadline | None" = None
+) -> tuple[bool, bool, list[str]]:
+    """Inspect an extracted attachment, recursing into nested containers."""
+    if kind == "text":
+        from text_unicode import inspect_text  # local import avoids a cycle
+
+        ta = inspect_text(data.decode("utf-8", errors="surrogateescape"))
+        return False, bool(ta.suspicious_total), [f"layer-a x{ta.suspicious_total}"]
+    if kind == "image":
+        from image_meta import inspect_image
+
+        rep = inspect_image(tmp, data=data)
+        return rep.has_c2pa, rep.has_ai_metadata, rep.findings
+    if kind == "av":
+        from av_meta import inspect_av
+
+        rep = inspect_av(tmp, data=data)
+        return rep.has_c2pa, rep.has_ai_metadata, rep.findings
+    if kind == "container":
+        rep = inspect_container(tmp, data=data, _depth=depth + 1, deadline=deadline)
+        findings = list(rep.findings)
+        if rep.details.get("attachments_truncated"):
+            findings.append("nested attachment scan truncated (depth cap or budget)")
+        return rep.has_c2pa, rep.has_ai_metadata, findings
+    return False, False, [f"unsupported attachment kind: {kind}"]
+
+
+def _pdf_extract_attachments(
+    path: Path, deadline: "_Deadline | None", staging: Path
+) -> tuple[list[dict], list[dict]]:
+    """Extract every embedded file into *staging*.
+
+    Returns ``(ok, skipped)``: ``ok`` entries carry ``in_path``; ``skipped``
+    entries carry an ``error`` (extract failed / over size cap) so the clean
+    pass can report what it could not touch rather than dropping it silently.
+    Used up front in ``clean_pdf`` so attachment bytes are preserved even when
+    the Ghostscript deep-image pass — which re-distills the page and drops
+    embedded files — runs later.
+    """
+    attachments = _pdf_attachment_list(path, deadline)
+    ok: list[dict] = []
+    skipped: list[dict] = []
+    for i, att in enumerate(attachments):
+        safe_name = Path(att["name"]).name or f"att-{i}"
+        in_path = staging / f"{i}-in{Path(safe_name).suffix}"
+        n = _pdf_show_attachment(path, att["key"], in_path, deadline)
+        if n < 0:
+            skipped.append({**att, "error": "extract failed"})
+            continue
+        if n > MAX_ATTACHMENT_BYTES:
+            skipped.append({**att, "error": "attachment too large"})
+            continue
+        ok.append({**att, "in_path": in_path})
+    return ok, skipped
+
+
+def _pdf_clean_attachments(
+    path: Path,
+    dest: Path,
+    actions: list[str],
+    deadline: "_Deadline | None",
+    mode: str,
+    depth: int = 0,
+) -> dict[str, Any]:
+    """Strip embedded-file metadata, re-embedding cleaned bytes via qpdf.
+
+    Attachments are extracted from *path* (the original, unmodified input) and
+    re-embedded into *dest*, because some earlier pass (the Ghostscript
+    deep-image re-distill) may have dropped them from *dest*. Returns
+    ``{"attachments": [...], "processed": bool, "qpdf_absent": bool}``.
+    """
+    qpdf = which("qpdf")
+    if not qpdf:
+        actions.append(
+            "warning: embedded-file attachments left in place; install qpdf for the attachment pass"
+        )
+        return {"attachments": [], "processed": False, "qpdf_absent": True}
+    if depth > MAX_ATTACHMENT_DEPTH:
+        actions.append(f"warning: attachment recursion capped at depth {MAX_ATTACHMENT_DEPTH}")
+        return {"attachments": [], "processed": False, "qpdf_absent": False}
+    if deadline is not None and deadline.spent():
+        actions.append("attachment pass skipped: clean budget exhausted")
+        return {"attachments": [], "processed": False, "qpdf_absent": False}
+
+    results: list[dict] = []
+    processed = False
+    with tempfile.TemporaryDirectory(prefix="wr-att-") as staging:
+        attachments, skipped = _pdf_extract_attachments(path, deadline, Path(staging))
+        if skipped:
+            for att in skipped:
+                actions.append(f"skipped attachment '{att['name']}': {att['error']}")
+                results.append({**att, "kind": "unknown", "cleaned": False, "error": att["error"]})
+        if not attachments:
+            if not skipped:
+                actions.append("no embedded attachments to clean")
+            return {"attachments": results, "processed": False, "qpdf_absent": False}
+
+        # Did a re-distill drop the attachments from dest? If not, re-embedding
+        # only the changed ones is enough; if so, every attachment is restored.
+        dest_has = bool(_pdf_attachment_list(dest, deadline))
+        for i, att in enumerate(attachments):
+            if deadline is not None and deadline.spent():
+                actions.append("attachment pass stopped: clean budget exhausted")
+                break
+            name = att["name"]
+            in_path = att["in_path"]
+            data = in_path.read_bytes()
+            ext = Path(name).suffix or Path(in_path.name).suffix
+            kind = _classify_attachment(name, data)
+            has_c2pa, has_ai, findings = _inspect_attachment_bytes(
+                in_path, data, kind, depth, deadline
+            )
+            should_clean = mode == "always" or (mode == "auto" and (has_c2pa or has_ai))
+            # The report must not leak the on-disk staging path.
+            report_att = {k: v for k, v in att.items() if k != "in_path"}
+            if not should_clean:
+                results.append(
+                    {
+                        **report_att,
+                        "kind": kind,
+                        "cleaned": False,
+                        "still_has_c2pa": has_c2pa,
+                        "still_has_ai_metadata": has_ai,
+                        "findings": findings,
+                        "actions": [],
+                    }
+                )
+                # A destroyed attachment must still come back, original bytes.
+                if not dest_has and not _add_attachment(
+                    dest, att, in_path, staging, remove_existing=False, deadline=deadline
+                ):
+                    results[-1]["error"] = "re-embed failed"
+                continue
+            cleaned_bytes, clean_actions = _clean_attachment_bytes(in_path, data, kind, mode, depth)
+            if cleaned_bytes is None:
+                results.append(
+                    {**report_att, "kind": kind, "cleaned": False, "error": "clean failed"}
+                )
+                continue
+            processed = True
+            clean_path = Path(staging) / f"att-{i}-out{ext}"
+            safe_write_bytes(clean_path, cleaned_bytes)
+            if not _add_attachment(
+                dest, att, clean_path, staging, remove_existing=dest_has, deadline=deadline
+            ):
+                results.append(
+                    {
+                        **report_att,
+                        "kind": kind,
+                        "cleaned": False,
+                        "error": "re-embed failed",
+                        "actions": clean_actions,
+                    }
+                )
+                actions.append(f"failed to re-embed cleaned attachment '{name}'")
+                continue
+            clean_actions.append(f"attachment '{name}': re-embedded")
+            rem_c2pa, rem_ai, rem_findings = _inspect_attachment_bytes(
+                clean_path, cleaned_bytes, kind, depth, deadline
+            )
+            results.append(
+                {
+                    **report_att,
+                    "kind": kind,
+                    "cleaned": True,
+                    "still_has_c2pa": rem_c2pa,
+                    "still_has_ai_metadata": rem_ai,
+                    "findings": rem_findings,
+                    "actions": clean_actions,
+                }
+            )
+
+    if processed:
+        actions.append("embedded-file attachments cleaned")
+    return {"attachments": results, "processed": processed, "qpdf_absent": False}
+
+
+def _add_attachment(
+    dest: Path,
+    att: dict[str, Any],
+    add_path: Path,
+    staging: str,
+    *,
+    remove_existing: bool,
+    deadline: "_Deadline | None" = None,
+) -> bool:
+    """Add (and optionally replace) one attachment's bytes in *dest* in place.
+
+    qpdf rewrites the document, so the result is staged and swapped in via the
+    safe writer. ``remove_existing`` is False when a prior re-distill dropped
+    the attachment, in which case the *add* must not try to remove a key that
+    no longer exists.
+    """
+    tmp = Path(staging) / "rebuilt.pdf"
+    cmd: list[str] = []
+    if remove_existing:
+        cmd.append(f"--remove-attachment={att['key']}")
+    cmd += ["--add-attachment", safe_arg(str(add_path))]
+    cmd += [f"--key={att['key']}", f"--filename={att['name'] or att['key']}"]
+    if att.get("mimetype"):
+        cmd += [f"--mimetype={att['mimetype']}"]
+    if att.get("description"):
+        cmd += [f"--description={att['description']}"]
+    to = _pdf_iso_to_pdf_date(att.get("creationdate"))
+    if to:
+        cmd += [f"--creationdate={to}"]
+    td = _pdf_iso_to_pdf_date(att.get("modificationdate"))
+    if td:
+        cmd += [f"--moddate={td}"]
+    cmd += ["--", safe_arg(str(dest)), safe_arg(str(tmp))]
+    qpdf = which("qpdf")
+    if not qpdf:
+        return False
+    try:
+        r = subprocess.run(
+            [qpdf, *cmd],
+            capture_output=True,
+            text=True,
+            timeout=(
+                _QPDF_ATTACH_TIMEOUT if deadline is None else deadline.timeout(_QPDF_ATTACH_TIMEOUT)
+            ),
+            check=False,
+            preexec_fn=subprocess_preexec_fn,
+            creationflags=subprocess_creationflags,
+        )
+    except Exception:
+        return False
+    if r.returncode != 0 or not tmp.is_file() or tmp.stat().st_size == 0:
+        tmp.unlink(missing_ok=True)
+        return False
+    safe_write_bytes(dest, tmp.read_bytes())
+    return True
+
+
+def _clean_attachment_bytes(
+    tmp: Path, data: bytes, kind: str, mode: str, depth: int
+) -> tuple[bytes | None, list[str]]:
+    """Clean an extracted attachment with the matching unified pipeline."""
+    if kind == "text":
+        from text_unicode import clean_text
+
+        cleaned, stats = clean_text(data.decode("utf-8", errors="surrogateescape"))
+        # Re-encode with surrogateescape so invalid bytes preserved by the
+        # decode are round-tripped instead of raising UnicodeEncodeError.
+        return cleaned.encode("utf-8", errors="surrogateescape"), [
+            f"text layer A: removed={stats['removed_count']} replaced={stats['replaced_count']}"
+        ]
+    if kind == "image":
+        from image_meta import clean_image
+
+        dest = tmp.with_name(tmp.name + ".cleaned")
+        result = clean_image(tmp, dest, strip_all_metadata=(mode == "always"))
+        if not dest.is_file():
+            return None, []
+        return dest.read_bytes(), result.get("actions", [])
+    if kind == "av":
+        from av_meta import clean_av
+
+        dest = tmp.with_name(tmp.name + ".cleaned")
+        result = clean_av(tmp, dest, strip_all_metadata=(mode == "always"))
+        if not dest.is_file():
+            return None, []
+        return dest.read_bytes(), result.get("actions", [])
+    if kind == "container":
+        dest = tmp.with_name(tmp.name + ".cleaned")
+        result = clean_container(
+            tmp,
+            dest,
+            fmt=None,
+            also_layer_a_text=True,
+            deep_images="auto",
+            normalize_spaces=True,
+            clean_attachments=mode,
+            _depth=depth + 1,
+        )
+        if not dest.is_file():
+            return None, []
+        return dest.read_bytes(), result.get("actions", [])
+    return None, [f"unsupported attachment kind: {kind}"]
+
+
+def clean_pdf(
+    path: Path,
+    dest: Path,
+    *,
+    deep_images: str = "auto",
+    clean_attachments: str = DEFAULT_CLEAN_ATTACHMENTS,
+    depth: int = 0,
+) -> tuple[list[str], dict]:
     """Best-effort PDF clean. Prefers exiftool; falls back to XMP strip warning.
 
     ``deep_images`` controls the Ghostscript re-distill that reaches metadata
@@ -2768,6 +3841,15 @@ def clean_pdf(path: Path, dest: Path, *, deep_images: str = "auto") -> tuple[lis
     * ``"lossless"`` -- deep pass without the recompressing escalation, so
       image data is never touched.
     * ``"never"`` -- skip it.
+
+    ``clean_attachments`` controls the pass over embedded files (paperclips):
+
+    * ``"always"`` (default) -- clean every attachment's metadata
+      (``strip_all_metadata`` semantics on the attachment), recursing into
+      nested containers regardless of markers.
+    * ``"auto"`` -- clean an attachment only when it carries AI/C2PA provenance
+      markers; recurse with the same rule.
+    * ``"never"`` -- leave attachments untouched.
     """
     actions: list[str] = []
     data = path.read_bytes()
@@ -2778,6 +3860,11 @@ def clean_pdf(path: Path, dest: Path, *, deep_images: str = "auto") -> tuple[lis
     if deep_images not in DEEP_IMAGE_MODES:
         raise ValueError(
             f"deep_images must be one of {sorted(DEEP_IMAGE_MODES)}, got {deep_images!r}"
+        )
+    if clean_attachments not in CLEAN_ATTACHMENT_MODES:
+        raise ValueError(
+            f"clean_attachments must be one of {sorted(CLEAN_ATTACHMENT_MODES)}, "
+            f"got {clean_attachments!r}"
         )
 
     deadline = _Deadline(PDF_CLEAN_BUDGET_SECONDS)
@@ -2830,7 +3917,10 @@ def clean_pdf(path: Path, dest: Path, *, deep_images: str = "auto") -> tuple[lis
 
     def _markers_left() -> bool:
         current = dest.read_bytes()
-        res_c2pa, res_ai, _f, _d = inspect_pdf(dest, current)
+        # include_attachments=False: attachment markers are handled by the
+        # attachment pass, and ignoring them here keeps the deep-image pass from
+        # running (and dropping the attachments) on an attachment-only marker.
+        res_c2pa, res_ai, _f, _d = inspect_pdf(dest, current, include_attachments=False)
         # inspect_pdf excludes stream payloads, so ask the streams directly too:
         # without c2patool nothing else would notice a manifest that only exists
         # inside an image.
@@ -2908,16 +3998,39 @@ def clean_pdf(path: Path, dest: Path, *, deep_images: str = "auto") -> tuple[lis
     if c2patool:
         actions.append("c2patool available for inspect; strip via exiftool/re-export")
 
+    attachments: dict[str, Any] = {"attachments": [], "processed": False, "qpdf_absent": False}
+    attachment_degraded = False
+    # Even in "never" mode the deep-image pass may have dropped the embedded
+    # files from dest, so the originals still have to be restored. The helper
+    # re-embeds unchanged bytes when mode is "never", so nothing is cleaned.
+    if clean_attachments != "never" or deep_ran:
+        attachments = _pdf_clean_attachments(
+            path, dest, actions, deadline, clean_attachments, depth=depth
+        )
+        if attachments.get("qpdf_absent"):
+            attachment_degraded = True
+        # Re-settle document-level metadata: re-embedding attachments via qpdf
+        # re-serializes the file, which can re-expose a /Producer.
+        if attachments.get("processed") and exiftool:
+            if _exiftool_strip(exiftool, dest, actions, deadline):
+                rewritten = _pdf_structural_rewrite(dest, actions, deadline) or rewritten
+            else:
+                attachment_degraded = True
+
     meta: dict[str, Any] = {
         "mode": document_mode,
         "structural_rewrite": rewritten,
         "deep_images": mode,
         "deep_image_pass": deep_ran,
         "images_reencoded": reencoded,
+        "attachments": attachments["attachments"],
+        "attachments_processed": attachments["processed"],
     }
     if not exiftool:
         # The deep pass may well have run, but the document-level strip was
         # the stdlib one, so the result is still best-effort.
+        meta["degraded"] = True
+    elif attachment_degraded:
         meta["degraded"] = True
     return actions, meta
 
@@ -2927,7 +4040,13 @@ def clean_pdf(path: Path, dest: Path, *, deep_images: str = "auto") -> tuple[lis
 # ---------------------------------------------------------------------------
 
 
-def inspect_container(path: Path, *, data: bytes | None = None) -> ContainerInspectReport:
+def inspect_container(
+    path: Path,
+    *,
+    data: bytes | None = None,
+    _depth: int = 0,
+    deadline: "_Deadline | None" = None,
+) -> ContainerInspectReport:
     """Inspect a container for provenance, AI metadata, and Layer-A carriers.
 
     Delegates to the format-specific inspector and unions in a Layer-A scan of
@@ -2951,7 +4070,9 @@ def inspect_container(path: Path, *, data: bytes | None = None) -> ContainerInsp
     if fmt == "svg":
         has_c2pa, has_ai, findings, details = inspect_svg(data)
     elif fmt == "pdf":
-        has_c2pa, has_ai, findings, details = inspect_pdf(path, data)
+        has_c2pa, has_ai, findings, details = inspect_pdf(
+            path, data, depth=_depth, deadline=deadline
+        )
         tools = details.pop("tools", {})
     elif fmt == "docx":
         has_c2pa, has_ai, findings, details = inspect_docx(data, zip_budget)
@@ -2975,6 +4096,9 @@ def inspect_container(path: Path, *, data: bytes | None = None) -> ContainerInsp
     elif fmt == "markdown":
         body = data.decode("utf-8", errors="surrogateescape")
         has_c2pa, has_ai, findings, details = inspect_markdown(body)
+    elif fmt == "latex":
+        body = data.decode("utf-8", errors="surrogateescape")
+        has_c2pa, has_ai, findings, details = inspect_latex(body)
     else:
         has_c2pa, has_ai, findings = False, False, [f"unsupported container: {fmt}"]
         details = {"unsupported": True}
@@ -2983,7 +4107,7 @@ def inspect_container(path: Path, *, data: bytes | None = None) -> ContainerInsp
     # inspect predicts clean rather than contradicting it.
     layer_a_total = 0
     layer_a_hits: list[dict] = []
-    if fmt in ("markdown", "html"):
+    if fmt in ("markdown", "html", "latex"):
         from text_unicode import inspect_text  # local import to avoid cycles
 
         ta = inspect_text(body).to_dict()
@@ -3037,6 +4161,10 @@ def inspect_container(path: Path, *, data: bytes | None = None) -> ContainerInsp
         notes.append(
             "EPUB: package-document metadata, XHTML meta/JSON-LD, and embedded media are scanned"
         )
+    elif fmt == "latex":
+        notes.append(
+            "LaTeX: \\hypersetup/\\pdfinfo provenance fields and provenance/tooling comment lines are scanned"
+        )
     if "unsupported" in details:
         notes.append(f"format not fully inspected: {fmt}")
     if layer_a_total:
@@ -3070,6 +4198,8 @@ def clean_container(
     also_layer_a_text: bool = True,
     deep_images: str = "auto",
     normalize_spaces: bool = True,
+    clean_attachments: str = DEFAULT_CLEAN_ATTACHMENTS,
+    _depth: int = 0,
 ) -> dict[str, Any]:
     """Clean container metadata; optionally Layer-A scrub text bodies for md/html.
 
@@ -3090,7 +4220,13 @@ def clean_container(
         cleaned, actions = clean_svg(data)
         safe_write_bytes(dest, cleaned)
     elif fmt == "pdf":
-        actions, meta_extra = clean_pdf(path, dest, deep_images=deep_images)
+        actions, meta_extra = clean_pdf(
+            path,
+            dest,
+            deep_images=deep_images,
+            clean_attachments=clean_attachments,
+            depth=_depth,
+        )
         meta.update(meta_extra)
     elif fmt == "docx":
         cleaned, actions = clean_docx(
@@ -3131,6 +4267,17 @@ def clean_container(
     elif fmt == "markdown":
         text = data.decode("utf-8", errors="surrogateescape")
         text, actions = clean_markdown(text)
+        if also_layer_a_text:
+            text2, stats = clean_text(text, normalize_spaces=normalize_spaces)
+            if stats["removed_count"] or stats["replaced_count"]:
+                actions.append(
+                    f"layer A text: removed={stats['removed_count']} replaced={stats['replaced_count']}"
+                )
+                text = text2
+        safe_write_text(dest, text)
+    elif fmt == "latex":
+        text = data.decode("utf-8", errors="surrogateescape")
+        text, actions = clean_latex(text)
         if also_layer_a_text:
             text2, stats = clean_text(text, normalize_spaces=normalize_spaces)
             if stats["removed_count"] or stats["replaced_count"]:

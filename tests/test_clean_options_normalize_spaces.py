@@ -40,6 +40,10 @@ def test_option_is_allowed():
     assert server.ALLOWED_CLEAN_OPTIONS.get("normalize_spaces") is bool
 
 
+def test_clean_attachments_option_is_allowed():
+    assert server.ALLOWED_CLEAN_OPTIONS.get("clean_attachments") is str
+
+
 def test_default_still_normalizes():
     out = _clean({})
     assert NBSP not in out

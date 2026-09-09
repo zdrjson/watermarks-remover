@@ -45,7 +45,6 @@ SOURCE_NAMES = (
     "Panel.svelte",
     "guide.rst",
     "manual.adoc",
-    "paper.tex",
     "settings.ini",
     "rows.tsv",
 )

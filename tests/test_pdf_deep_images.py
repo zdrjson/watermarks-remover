@@ -224,7 +224,9 @@ def test_exiftool_failure_falls_back_to_degraded_xmp_strip(tmp_path, monkeypatch
     assert meta["degraded"] is True
     assert b"contentauth" not in dest.read_bytes()
     assert any("blanked XMP" in action for action in actions)
-    assert not any("qpdf" in action for action in actions)
+    # No structural rewrite ran (no qpdf), but the attachment pass still warns
+    # that qpdf is required; assert the rewrite itself is absent, not the word.
+    assert not any("qpdf rewrite" in action or "qpdf --linearize" in action for action in actions)
 
 
 def test_missing_exiftool_uses_degraded_xmp_strip(tmp_path, monkeypatch):
@@ -245,6 +247,8 @@ def test_missing_exiftool_uses_degraded_xmp_strip(tmp_path, monkeypatch):
         "deep_images": "never",
         "deep_image_pass": False,
         "images_reencoded": False,
+        "attachments": [],
+        "attachments_processed": False,
         "degraded": True,
     }
     assert b"contentauth" not in dest.read_bytes()

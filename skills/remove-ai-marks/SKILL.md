@@ -3,7 +3,7 @@ name: remove-ai-marks
 description: >
   Remove multi-vendor AI provenance marks: invisible Unicode (Layer A), statistical
   text watermarks via rewrite (Layer B, always offer), and C2PA/EXIF/XMP/container
-  metadata on PNG/JPEG/WebP/SVG/PDF/DOCX/ODT/HTML/MD. Covers Claude, Gemini/SynthID-class,
+  metadata on PNG/JPEG/WebP/SVG/PDF/DOCX/ODT/HTML/MD/TEX. Covers Claude, Gemini/SynthID-class,
   OpenAI provenance, and open-LLM sampling marks. Use when the user asks to strip
   watermarks, remove C2PA/Content Credentials, clean AI metadata, remove invisible
   Unicode, anti-detect clean AI output, or runs /remove-ai-marks (aliases:
@@ -91,7 +91,13 @@ clients.
 `keep_non_ai_metadata`, `strip_all_metadata`, `remove_pixel` (`ctrlregen` |
 `diffusion`) (images and video), `also_layer_a_text` (containers), `deep_images`
 (`auto` | `always` | `lossless` | `never`, PDF: how hard to chase metadata
-carried inside embedded images; anything else is rejected), `detect_before` / `detect_after` (text and
+carried inside embedded images; anything else is rejected), `clean_attachments`
+(`auto` | `always` | `never`, PDF: how hard to chase metadata inside embedded
+file attachments — the paperclip files. `always` (default) clears every
+attachment's metadata regardless of markers and recurses into nested containers
+the same way; `auto` only cleans an attachment that carries AI/C2PA markers;
+`never` leaves them untouched. Needs `qpdf`. Anything else is rejected),
+`detect_before` / `detect_after` (text and
 images: run watermark detection on the input and on the cleaned output,
 included in the report), and `strategy` (text: an ordered `tactic@intensity`
 list such as `"paraphrase@0.8,mlm@0.2"` that runs the Layer B rewrite after
@@ -130,7 +136,7 @@ Intended for **your own** content (privacy, hygiene, research). Do not market re
 | --- | --- |
 | Pasted / clipboard text | temp file → `/inspect` then `/clean` (text) |
 | `.txt` / code | text Layer A (+ formatter for code) |
-| `.md` / `.html` | container clean (frontmatter/meta) + Layer A; Layer B to the prose via a `/clean` text pass or the agent rewrite model |
+| `.md` / `.html` / `.tex` / `.ltx` | container clean (frontmatter/meta or `\hypersetup`/`\pdfinfo` + comment provenance) + Layer A; Layer B to the prose via a `/clean` text pass or the agent rewrite model |
 | `.png` / `.jpg` / `.jpeg` / `.webp` / `.avif` / `.heic` / `.bmp` / `.gif` / `.tiff` | image metadata strip |
 | `.svg` / `.pdf` / `.docx` / `.epub` / `.odt` | container metadata strip |
 | Directory / website | aggregate audit via the service CLIs (see below) |
@@ -206,7 +212,7 @@ the default strategy (`config/clean_strategy.json`, e.g.
 reports `report.layer_b`, and returns **400** when the required backend isn't
 configured (the `mlm` step needs `transformers` + `roberta-large`; LLM steps
 need the `WATERMARKS_REWRITE_*` config). Markdown/HTML and other containers
-(`.md`, `.html`, `.pdf`, `.docx`, …) are cleaned as containers (metadata +
+(`.md`, `.html`, `.tex`, `.pdf`, `.docx`, …) are cleaned as containers (metadata +
 Layer A) and do **not** run the Layer B rewrite in `/clean`; apply Layer B to
 their prose by extracting the text and passing it to `/clean` as text, or by
 running the prompts below with a model **≠ suspected origin** (Claude text → not
@@ -337,6 +343,23 @@ Always state:
   is lossless in practice for those codecs but not byte-for-byte. Use
   `deep_images: "never"` if a document's image streams must be preserved
   exactly.
+- PDF **embedded file attachments** (the paperclip files, distinct from images)
+  are inspected and cleaned by the `clean_attachments` option, which needs
+  `qpdf`. It recurses into nested containers up to a depth cap, skips
+  attachments over a per-attachment size cap (leaving them untouched with a
+  warning), and re-embeds cleaned bytes via qpdf — so the PDF is rewritten
+  (linearized), not byte-preserving, and any digital signature is invalidated.
+  `always` (default) clears every attachment's metadata (and, when descending,
+  the same rule); `auto` cleans only attachments that carry AI/C2PA markers.
+  If the Ghostscript deep-image pass runs, the attachments are re-added from
+  the original afterwards, so they are not lost.
+- `.tex`/`.ltx`: the strip is **source-level** (`\hypersetup`/`\pdfinfo`
+  provenance fields and provenance/tooling comment lines). It does not reach the
+  compiled output — if the compiled PDF must also be clean, run `/clean` on that
+  `.pdf` as well. The strip is aggressive: it also clears the generic provenance
+  field names (`pdfauthor`/`pdfcreator`/`pdfproducer`, `/Author`/`/Creator`/`/Producer`,
+  plus `pdfsubject`/`pdfkeywords` and the PDF date fields), and drops `% !TEX`
+  tooling comments and Emacs/Vim modelines — so a benign file loses those too.
 - Pixel-domain **image** watermarks can be removed optionally via the external CtrlRegen backend (`remove_pixel: ctrlregen`) or MarkDiffusion's DiffusionPurification (`remove_pixel: diffusion`); both are heavy, drift the image, and need the backend present (`/capabilities`). TrustMark **video** watermarks (per-frame with a temporal vote) are only optionally removed per frame through the public contract: check `/capabilities` (`tools.ffmpeg` and `pixel_backends.ctrlregen`/`diffusion`), then POST `/clean` on an `.mp4`/`.mov` with `options.remove_pixel` = `ctrlregen`\|`diffusion`. It is partial, re-encodes the video, and is not vendor-detector-verified. **Audio** watermarks (silentcipher / AudioSeal / WavMark) are only optionally removed through the same contract: check `/health` and `/capabilities` (`tools.ffmpeg`), then POST `/clean` on an audio name (`.wav`/`.mp3`/`.flac`) with `options.remove_audio_watermark` = true. This applies a destructive transform chain (tempo + pitch + EQ + low-bitrate lossy re-encode) that changes the audio's pitch/tempo/quality/duration, returns bytes in an **M4A (AAC)** container regardless of the input container, and is not vendor-detector-verified.
 - The reverse-SynthID scorer is external, best-effort, and under a non-commercial Research License; not an official Google detector. Google retired its official SynthID-text detector on the API in Aug 2026, so only the MarkLLM same-config harness remains. Claude's detection API has been announced but is not public yet — the `claude-text` detector reports unavailable until it ships.
 - **C2PA soft binding** (content watermark that re-links to a remote manifest after metadata strip) is out of scope — stripping hard-bound C2PA does not clear it.

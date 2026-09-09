@@ -45,6 +45,17 @@ def main() -> int:
             "recompresses images; never skips the pass entirely"
         ),
     )
+    p.add_argument(
+        "--clean-attachments",
+        choices=("auto", "always", "never"),
+        default="always",
+        help=(
+            "PDF: strip metadata inside embedded file attachments (paperclips), "
+            "recursing into nested containers. always (default) clears every "
+            "attachment's metadata; auto only for attachments that carry "
+            "AI/C2PA markers; never leaves them untouched"
+        ),
+    )
     p.add_argument("--aggressive-homoglyphs", action="store_true")
     p.add_argument(
         "--keep-non-ai-metadata",
@@ -230,7 +241,13 @@ def main() -> int:
         return 1 if residual else 0
 
     try:
-        result = clean_container(src, dest, fmt=container_fmt, deep_images=args.deep_images)
+        result = clean_container(
+            src,
+            dest,
+            fmt=container_fmt,
+            deep_images=args.deep_images,
+            clean_attachments=args.clean_attachments,
+        )
     except Exception as e:
         eprint(f"error: {e}")
         return 1

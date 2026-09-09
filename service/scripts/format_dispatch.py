@@ -49,6 +49,8 @@ CONTAINER_EXTS = {
     ".md",
     ".markdown",
     ".mdx",
+    ".tex",
+    ".ltx",
 }
 #: Plain-text formats the Layer A scanner reads and the clean hooks rewrite. An
 #: absent suffix is left unread and unrouted, so keep this table broad: every
@@ -107,7 +109,6 @@ TEXT_EXTS = {
     ".adoc",
     ".asciidoc",
     ".org",
-    ".tex",
     # Localization resources: where user-facing strings actually live. Text is
     # read as UTF-8, so this covers UTF-8 .po/.pot/.arb; UTF-16 .strings still
     # needs the BOM-aware decoder.
