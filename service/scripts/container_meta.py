@@ -19,10 +19,11 @@ import time
 import urllib.parse
 import zipfile
 import zlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree as ET
 
 from common import (
     c2patool_probe_note,
@@ -722,6 +723,35 @@ def _parse_simple_yaml_keys(block: str) -> list[tuple[str, str, int]]:
     return rows
 
 
+def _fm_value_continuation(lines: list[str], start: int, end: int) -> str:
+    """Value lines that continue a top-level key between two key lines.
+
+    Block scalars (`key: >` / `key: |`), wrapped plain values, and list items
+    (`- item`) all carry the value on the lines after the key. The extent is
+    the same one the clean path already drops: nested content up to the next
+    top-level key (or the end of the frontmatter block).
+    """
+    parts: list[str] = []
+    for line in lines[start:end]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue  # blank lines and comments belong to whichever block they sit in
+        if line[0] in (" ", "\t", "-"):
+            parts.append(stripped)
+    return "\n".join(parts)
+
+
+def _fm_joined_value(rows: list[tuple[str, str, int]], idx: int, lines: list[str]) -> str:
+    """The value of rows[idx] across its continuation lines, newline-joined."""
+    _key, line, i = rows[idx]
+    val = line.split(":", 1)[1] if ":" in line else ""
+    end = rows[idx + 1][2] if idx + 1 < len(rows) else len(lines)
+    cont = _fm_value_continuation(lines, i + 1, end)
+    if cont:
+        val = f"{val}\n{cont}" if val.strip() else cont
+    return val
+
+
 # Frontmatter keys that are Claude Code agent/skill *configuration* and happen
 # to collide with provenance key names. `model:` is in AI_FRONTMATTER_KEYS --
 # correct for a generated document, wrong for `.claude/agents/*.md`, where
@@ -750,17 +780,19 @@ def inspect_markdown(text: str) -> tuple[bool, bool, list[str], dict]:
     if m:
         has_fm = True
         block = m.group(1)
+        block_lines = block.splitlines()
         rows = _parse_simple_yaml_keys(block)
         is_agent = _is_agent_frontmatter([k for k, _l, _i in rows])
-        for key, _line, _i in rows:
+        for idx, (key, _line, _i) in enumerate(rows):
             keys.append(key)
             if is_agent and key.lower() in _AGENT_CONFIG_KEYS:
                 pass  # agent configuration, not provenance -- value still checked below
             elif key.lower() in AI_FRONTMATTER_KEYS or AI_META_NAME_RE.search(key):
                 has_ai = True
                 findings.append(f"frontmatter key: {key}")
-            # also check value
-            val = _line.split(":", 1)[1] if ":" in _line else ""
+            # also check value -- it may span continuation lines (block
+            # scalars, wrapped values, list items), so scan the joined text
+            val = _fm_joined_value(rows, idx, block_lines)
             if named_value_is_ai(key, val):
                 has_ai = True
                 findings.append(f"frontmatter value hit on {key}")
@@ -786,10 +818,13 @@ def clean_markdown(text: str) -> tuple[str, list[str]]:
     if m:
         block = m.group(1)
         body = text[m.end() :]
+        block_lines = block.splitlines()
+        rows = _parse_simple_yaml_keys(block)
+        row_at = {i: n for n, (_k, _l, i) in enumerate(rows)}
         kept: list[str] = []
         dropping = False  # inside the nested block of a dropped top-level key
-        is_agent = _is_agent_frontmatter([k for k, _l, _i in _parse_simple_yaml_keys(block)])
-        for line in block.splitlines():
+        is_agent = _is_agent_frontmatter([k for k, _l, _i in rows])
+        for li, line in enumerate(block_lines):
             stripped = line.strip()
 
             # Blank lines and comments belong to whichever block we are inside.
@@ -811,7 +846,12 @@ def clean_markdown(text: str) -> tuple[str, list[str]]:
                 continue
 
             key = km.group(1)
-            val = line.split(":", 1)[1] if ":" in line else ""
+            # A value may span continuation lines (block scalars, wrapped
+            # values, list items); scan the joined text -- the same text
+            # inspect_markdown sees -- so a phrase hidden there cannot
+            # survive, and the dropping logic below removes the whole block.
+            n = row_at.get(li)
+            val = _fm_joined_value(rows, n, block_lines) if n is not None else ""
             if is_agent and key.lower() in _AGENT_CONFIG_KEYS:
                 pass  # agent configuration -- fall through to the value check
             elif key.lower() in AI_FRONTMATTER_KEYS or AI_META_NAME_RE.search(key):
@@ -1373,8 +1413,13 @@ def clean_latex(text: str) -> tuple[str, list[str]]:
 # HTML
 # ---------------------------------------------------------------------------
 
+# Quote-aware on purpose: the body skips over quoted attribute values, so a
+# '>' inside a quoted `content` ("Compare Claude > GPT-4o") neither truncates
+# the tag nor leaves the rest of the attribute behind as stray text. Without
+# this, `_meta_attrs` never saw a value past the '>' and the whole-tag scan
+# judged the truncated prefix, dropping the owner's own prose.
 _META_TAG_RE = re.compile(
-    r"<meta\b[^>]*>",
+    r"""<meta\b(?:"[^"]*"|'[^']*'|[^>"'])*>""",
     re.I,
 )
 _META_ATTR_RE = re.compile(
@@ -1596,8 +1641,10 @@ def inspect_html(text: str) -> tuple[bool, bool, list[str], dict]:
         findings.append(f"comment: {block[:120]}")
         if re.search(r"c2pa|content.?credential", block, re.I):
             has_c2pa = True
-    # data-ai* attributes
-    for m in re.finditer(r"\bdata-ai[\w-]*\s*=\s*[\"'][^\"']*[\"']", text, re.I):
+    # data-ai* attributes. The optional separator group keeps the match to
+    # the bare `data-ai` attribute or a `data-ai-*`/`data-ai_*` provenance name;
+    # without it, `data-aid` / `data-airline` matched too (issue #395).
+    for m in re.finditer(r"\bdata-ai(?:[-_][\w-]*)?\s*=\s*[\"'][^\"']*[\"']", text, re.I):
         has_ai = True
         findings.append(f"attr: {m.group(0)[:80]}")
 
@@ -1649,7 +1696,7 @@ def clean_html(text: str) -> tuple[str, list[str]]:
     out, n = _drop_provenance_comments(out)
     if n:
         actions.append(f"drop AI provenance comment x{n}")
-    out2, n = re.subn(r"\sdata-ai[\w-]*\s*=\s*[\"'][^\"']*[\"']", "", out, flags=re.I)
+    out2, n = re.subn(r"\sdata-ai(?:[-_][\w-]*)?\s*=\s*[\"'][^\"']*[\"']", "", out, flags=re.I)
     if n:
         actions.append(f"drop data-ai* attributes x{n}")
         out = out2
@@ -2005,8 +2052,110 @@ def _zip_namelist(data: bytes) -> list[str]:
 
 
 def _is_docx_meta_part(name: str) -> bool:
-    """Return True for DOCX/XLSX/PPTX parts that carry provenance, not visible content."""
-    return name.startswith(("docProps/", "customXml/"))
+    """Return True for OOXML parts that carry provenance or add-in state."""
+    low = name.lower()
+    return low.startswith(("docprops/", "customxml/")) or _is_ooxml_webextension_part(name)
+
+
+def _is_ooxml_webextension_part(name: str) -> bool:
+    """True for Office add-in metadata parts in Word, Excel, and PowerPoint."""
+    return bool(re.match(r"^(?:word|xl|ppt)/webextensions/", name, re.I))
+
+
+def office_owner_file(path: Path) -> Path | None:
+    """Return a sibling Office owner file that suggests the document is open."""
+    if not path.name:
+        return None
+    names = [f"~${path.name}"]
+    if len(path.name) > 2:
+        names.append(f"~${path.name[2:]}")
+    for name in dict.fromkeys(names):
+        candidate = path.with_name(name)
+        if candidate.exists():
+            return candidate
+    return None
+
+
+_WEBEXTENSION_MAX_FINDINGS = 30
+_WEBEXTENSION_AI_VENDOR_PREFIXES = (
+    "anthropic.",
+    "chatgpt.",
+    "claude.",
+    "copilot.",
+    "gemini.",
+    "openai.",
+    "synthid.",
+)
+
+
+class _WebExtensionFindingsLimitReached(Exception):
+    pass
+
+
+class _WebExtensionDoctypeRejected(Exception):
+    pass
+
+
+class _WebExtensionFindingsTarget:
+    """Stream XML start events without building a document tree."""
+
+    def __init__(self, on_start: Callable[[str, dict[str, str]], None]) -> None:
+        self._on_start = on_start
+
+    def start(self, tag: str, attributes: dict[str, str]) -> None:
+        self._on_start(tag, attributes)
+
+    def end(self, _tag: str) -> None:
+        pass
+
+    def data(self, _text: str) -> None:
+        pass
+
+    def doctype(self, *_args: object) -> None:
+        raise _WebExtensionDoctypeRejected
+
+    def close(self) -> None:
+        return None
+
+
+def _webextension_findings(name: str, raw: bytes) -> list[str]:
+    """Report Office add-in properties and references without scanning body text."""
+    findings: list[str] = []
+
+    def on_start(tag: str, attributes: dict[str, str]) -> None:
+        local_name = tag.rsplit("}", 1)[-1].casefold()
+        attributes_by_name = {
+            key.rsplit("}", 1)[-1].casefold(): value.strip() for key, value in attributes.items()
+        }
+        if local_name == "property":
+            property_name = attributes_by_name.get("name", "")
+            if property_name:
+                normalized = property_name.casefold()
+                vendor_property = any(
+                    normalized.startswith(prefix) or f".{prefix}" in normalized
+                    for prefix in _WEBEXTENSION_AI_VENDOR_PREFIXES
+                )
+                if vendor_property:
+                    findings.append(f"{name}: web-extension vendor property {property_name}")
+                else:
+                    findings.append(f"{name}: meta: web-extension property {property_name}")
+        elif local_name == "reference":
+            reference_id = attributes_by_name.get("id", "")
+            if reference_id:
+                findings.append(f"{name}: meta: web-extension reference id={reference_id}")
+        if len(findings) >= _WEBEXTENSION_MAX_FINDINGS:
+            raise _WebExtensionFindingsLimitReached
+
+    # The target rejects DOCTYPE declarations before entity declarations can be used.
+    parser = ET.XMLParser(target=_WebExtensionFindingsTarget(on_start))  # noqa: S314
+    with contextlib.suppress(
+        _WebExtensionFindingsLimitReached,
+        _WebExtensionDoctypeRejected,
+        ET.ParseError,
+    ):
+        parser.feed(raw)
+        parser.close()
+    return findings
 
 
 def _inspect_ooxml_zip(
@@ -2063,13 +2212,37 @@ def _inspect_ooxml_zip(
                 if not _is_docx_meta_part(name):
                     continue
                 raw = _read_zip_member(zf, info, budget)
+                webextension_part = _is_ooxml_webextension_part(name)
+                if webextension_part:
+                    webextension_hits = _webextension_findings(name, raw)
+                    if webextension_hits:
+                        if any(
+                            "web-extension vendor property " in hit for hit in webextension_hits
+                        ):
+                            has_ai = True
+                        findings.extend(webextension_hits)
                 c2, ai, hits = _blob_hits(raw)
+                if webextension_part and webextension_hits:
+                    # The structured finding already names a parsed vendor
+                    # property/reference. Avoid repeating the same vendor as
+                    # a weaker raw marker hit (e.g. "claude.fileId" plus
+                    # "ai:claude"). Keep unrelated markers and all C2PA hits.
+                    structured_text = " ".join(webextension_hits).casefold()
+                    hits = [
+                        hit
+                        for hit in hits
+                        if not (
+                            hit.lower().startswith("ai:")
+                            and hit.split(":", 1)[1].strip().casefold() in structured_text
+                        )
+                    ]
                 if c2 or ai:
                     if c2:
                         has_c2pa = True
                     if ai:
                         has_ai = True
-                    findings.append(f"{name}: {', '.join(hits[:6])}")
+                    if hits:
+                        findings.append(f"{name}: {', '.join(hits[:6])}")
             # always flag customXml presence lightly
             custom = [n for n in parts if n.startswith("customXml/")]
             if custom:
@@ -2121,10 +2294,15 @@ def _decode_xml_entities(s: str) -> str:
     """
 
     def _sub(m: re.Match[str]) -> str:
+        """Resolve one reference without passing unbounded digits to int()."""
         hex_digits, decimal, named = m.group(1), m.group(2), m.group(3)
         if named:
             return _XML_NAMED_ENTITIES[named]
-        codepoint = int(hex_digits, 16) if hex_digits else int(decimal)
+        digits = (hex_digits or decimal).lstrip("0") or "0"
+        # Unicode code points need at most six hex or seven decimal digits.
+        if len(digits) > (6 if hex_digits else 7):
+            return m.group(0)
+        codepoint = int(digits, 16 if hex_digits else 10)
         if codepoint == 0 or codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
             return m.group(0)  # not a character; leave for the real parser to reject
         try:
@@ -2396,10 +2574,11 @@ def _prune_dangling_relationships(
         return m.group(2) if m else ""
 
     def _drop(m: re.Match[str]) -> str:
+        """Use decoded targets for lookup while preserving each retained tag verbatim."""
         tag = m.group(0)
         if re.search(r"\bTargetMode\s*=", tag, re.I):
             return tag  # external (http / mailto / ...) — never pruned
-        target = _target_attr(tag)
+        target = _decode_xml_entities(_target_attr(tag))
         if target.startswith("/"):
             resolved = posixpath.normpath(target.lstrip("/"))
         else:
@@ -2556,6 +2735,13 @@ def _scrub_ooxml_zip(
                 actions.append(f"drop part {name}")
                 continue
 
+            # 2a. Office add-in state is stored outside the visible document
+            # body. Drop it from all supported OOXML packages; relationships
+            # to these parts are pruned after the archive is rewritten.
+            if _is_ooxml_webextension_part(name):
+                actions.append(f"drop Office web-extension part {name}")
+                continue
+
             # 3. docProps/ provenance
             if name in DOCX_META_PARTS or name.startswith("docProps/"):
                 if name.endswith("custom.xml"):
@@ -2605,6 +2791,15 @@ def _scrub_ooxml_zip(
                 )
                 if n:
                     actions.append(f"drop Content_Types custom.xml override x{n}")
+                    raw = new.encode("utf-8")
+                new, n = re.subn(
+                    r"""<Override\b(?=[^>]*\bPartName\s*=\s*["']/(?:word|xl|ppt)/webextensions/)[^>]*/>""",
+                    "",
+                    raw.decode("utf-8", errors="replace"),
+                    flags=re.I,
+                )
+                if n:
+                    actions.append(f"drop Content_Types web-extension overrides x{n}")
                     raw = new.encode("utf-8")
 
             # 5. Layer A text runs
@@ -4455,6 +4650,12 @@ def clean_container(
     data = path.read_bytes()
     fmt = fmt or detect_container_format(path, data)
     actions: list[str] = []
+    if fmt in {"docx", "xlsx", "pptx"}:
+        owner_file = office_owner_file(path)
+        if owner_file is not None:
+            raise ValueError(
+                f"refusing to clean an Office package while its owner file exists: {owner_file.name}"
+            )
     dest.parent.mkdir(parents=True, exist_ok=True)
     meta: dict[str, Any] = {"format": fmt}
 
