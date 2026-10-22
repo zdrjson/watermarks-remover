@@ -425,3 +425,20 @@ def test_meta_attrs_reads_past_an_embedded_quote() -> None:
         "content": "Bob's skills",
     }
     assert _meta_attrs("<meta name='description' content='say \"hi\"'>")["content"] == ('say "hi"')
+
+
+def test_meta_attrs_match_rules() -> None:
+    """The linear scan keeps the rules of the regex it replaced."""
+    assert _meta_attrs('<meta NAME="X" name="Y">') == {"name": "Y"}
+    assert _meta_attrs('<meta content\t=\n"Kept Case">') == {"content": "Kept Case"}
+    assert _meta_attrs('<meta property="og:description" generator="WordPress">') == {
+        "property": "og:description",
+        "generator": "WordPress",
+    }
+    assert _meta_attrs('<meta content="">') == {"content": ""}
+    assert _meta_attrs("<meta name=description content=Claude>") == {}
+    assert _meta_attrs('<meta name="description" content="unterminated') == {
+        "name": "description",
+    }
+    # No word boundary: "name" is a suffix of "filename".
+    assert _meta_attrs('<meta filename="x">') == {"name": "x"}

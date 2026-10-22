@@ -34,6 +34,7 @@ from container_meta import (
     ZipBudgetExceeded,
     _check_zip_budget,
     _drop_tag_blocks,
+    _meta_attrs,
     _pdf_structured_blob,
     _read_zip_member,
     _script_tag_is_jsonld,
@@ -311,6 +312,20 @@ def test_clean_svg_comment_end_forms():
     assert b"Anthropic" not in cleaned
     assert b"plain" in cleaned
     assert any("comment" in a for a in actions)
+
+
+def test_meta_attr_scan_is_linear_on_codeql_witness():
+    # CodeQL py/polynomial-redos (code-scanning alert 38): a tag starting with
+    # 'name="' and many repetitions of 'name="a'. The tempered-dot attribute
+    # regex was the finding; this forward scan must stay linear, including
+    # through clean_html, which is the upload path.
+    pump = 'name="' + 'name="a' * (256 * 1024 // 7)
+    attrs = _assert_completes_fast(_meta_attrs, pump)
+    # Last paired value. Locked so a scanner that bails out still fails.
+    assert attrs == {"name": "aname="}
+    page = "<meta " + pump + ">"
+    cleaned, _actions = _assert_completes_fast(clean_html, page)
+    assert cleaned == page
 
 
 def test_clean_html_jsonld_flood_is_linear():

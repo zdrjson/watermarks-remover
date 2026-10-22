@@ -1422,10 +1422,11 @@ _META_TAG_RE = re.compile(
     r"""<meta\b(?:"[^"]*"|'[^']*'|[^>"'])*>""",
     re.I,
 )
-_META_ATTR_RE = re.compile(
-    r"""(name|property|content|generator)\s*=\s*(["'])((?:(?!\2).)*)\2""",
-    re.I,
-)
+# Names read from a <meta> tag. Matched as a substring, with no word boundary:
+# the regex this replaced did the same, so filename="x" still yields name=x.
+# A backreference around the value is CodeQL py/polynomial-redos on a tag from
+# an uploaded document, so the walk below is a single forward scan.
+_META_ATTR_NAMES = ("name", "property", "content", "generator")
 
 # Known AI vendor names for the "generator" meta tag. A plain CMS generator
 # (WordPress, Elementor) is CMS provenance, not AI-generator metadata.
@@ -1438,16 +1439,49 @@ _GENERATOR_AI_RE = re.compile(
 def _meta_attrs(tag: str) -> dict[str, str]:
     """Return the ``name``/``property``/``content``/``generator`` values of a tag.
 
-    Attribute names and values are lower-cased in the keys, values are kept as
-    written, and a later attribute wins over an earlier one with the same name.
+    Keys are lower-cased, values are kept as written, and a later attribute
+    wins over an earlier one with the same name.
 
-    The value capture is quote-aware: a `[^"']*` body stops at the *other* quote
-    character, so `content="Bob's C2PA manifest"` parsed as the value "Bob" and
-    the free-prose scan never saw the marker that was actually there. An
-    unquoted value is not read at all, which leaves the whole-tag scan to
-    decide that case.
+    The value read is quote-aware: it runs to its own closing quote, so
+    ``content="Bob's C2PA manifest"`` is not cut at the apostrophe. An
+    unquoted value, or a quote with no closer, is not read at all, which
+    leaves the whole-tag scan to decide that case. A failed attempt resumes
+    one character later, as ``finditer`` did.
     """
-    return {m.group(1).lower(): m.group(3) for m in _META_ATTR_RE.finditer(tag)}
+    attrs: dict[str, str] = {}
+    n = len(tag)
+    i = 0
+    while i < n:
+        name = None
+        for candidate in _META_ATTR_NAMES:
+            end = i + len(candidate)
+            if end <= n and tag[i:end].lower() == candidate:
+                name = candidate
+                break
+        if name is None:
+            i += 1
+            continue
+        j = i + len(name)
+        while j < n and tag[j].isspace():
+            j += 1
+        if j >= n or tag[j] != "=":
+            i += 1
+            continue
+        j += 1
+        while j < n and tag[j].isspace():
+            j += 1
+        if j >= n or tag[j] not in "\"'":
+            i += 1
+            continue
+        quote = tag[j]
+        value_start = j + 1
+        value_end = tag.find(quote, value_start)
+        if value_end < 0:
+            i += 1
+            continue
+        attrs[name] = tag[value_start:value_end]
+        i = value_end + 1
+    return attrs
 
 
 def _is_cms_generator_meta(tag: str) -> bool:
